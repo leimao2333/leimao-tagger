@@ -28,7 +28,7 @@ import pc_tagger as core
 import source_engine
 import win_dialogs
 
-APP_VERSION = "v1.0.5"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.0.6"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):

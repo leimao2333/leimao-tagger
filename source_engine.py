@@ -28,7 +28,7 @@ import requests
 from bs4 import BeautifulSoup
 
 USER_AGENT = "leimao-pc-tagger/1.6"
-TIMEOUT = 25
+TIMEOUT = (5, 12)  # (连接, 读取) 秒；慢源快速跳过，避免单源卡几分钟
 
 _TRUTHY_PAGE_EXPR = re.compile(r"^[\d\s()+\-*%]*$")
 
