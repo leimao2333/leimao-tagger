@@ -299,6 +299,7 @@ class LegadoSource(BaseSource):
             (pages if "{{" in tpl else 1) for _, tpl in self.categories
         )
         done_pages = 0
+        stale = 0
         found: dict[str, TraversedItem] = {}
         for title, cat_tpl in self.categories:
             has_page = "{{" in cat_tpl
@@ -343,6 +344,13 @@ class LegadoSource(BaseSource):
                 log(f"  {self.name}「{title}」第 {page} 页：+{fresh}")
                 if not rows:
                     break
+                if fresh == 0:
+                    stale += 1
+                    if stale >= 3:  # 连续 3 页无新内容 = 站点翻页重复，跳过该源
+                        log(f"  {self.name}「{title}」连续 3 页无新内容，停止翻页")
+                        break
+                else:
+                    stale = 0
         return list(found.values())
 
 
@@ -397,6 +405,7 @@ class AppJsonSource(BaseSource):
         has_page = "{{" in self.url_tpl
         total_pages = 0 if unlimited else (pages if has_page else 1)
         done_pages = 0
+        stale = 0
         page = 0
         prev_url = None
         while True:
@@ -438,6 +447,13 @@ class AppJsonSource(BaseSource):
             log(f"  {self.name} 第 {page} 页：+{fresh}")
             if not rows:
                 break
+            if fresh == 0:
+                stale += 1
+                if stale >= 3:  # 连续 3 页无新内容 = 翻页重复
+                    log(f"  {self.name} 连续 3 页无新内容，停止翻页")
+                    break
+            else:
+                stale = 0
         return list(found.values())
 
 
@@ -454,6 +470,7 @@ class MacCmsSource(BaseSource):
     def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
         found: dict[str, TraversedItem] = {}
         unlimited = pages <= 0
+        stale = 0
         page = 0
         while True:
             page += 1
@@ -500,6 +517,13 @@ class MacCmsSource(BaseSource):
                 break
             if not rows:
                 break
+            if fresh == 0:
+                stale += 1
+                if stale >= 3:  # 连续 3 页无新内容 = 翻页重复
+                    log(f"  {self.name} 连续 3 页无新内容，停止翻页")
+                    break
+            else:
+                stale = 0
         return list(found.values())
 
 
