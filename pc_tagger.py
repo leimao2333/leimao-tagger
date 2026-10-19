@@ -35,6 +35,8 @@ import requests
 MODEL_URL = "https://hf-mirror.com/SmilingWolf/wd-v1-4-vit-tagger-v2/resolve/main/model.onnx"
 TAGS_URL = "https://hf-mirror.com/SmilingWolf/wd-v1-4-vit-tagger-v2/resolve/main/selected_tags.csv"
 INPUT_SIZE = 448
+CAMIE_MODEL_URL = "https://hf-mirror.com/Camais03/camie-tagger-v2/resolve/main/camie-tagger-v2.onnx"
+CAMIE_META_URL = "https://hf-mirror.com/Camais03/camie-tagger-v2/resolve/main/camie-tagger-v2-metadata.json"
 THRESHOLD = 0.30
 CONF_MIN, CONF_MAX = 20, 95
 ORIGIN_VISUAL = "视觉"
@@ -74,8 +76,26 @@ class Vocab:
 # ---------------------------------------------------------------- 模型
 
 
-def ensure_model(model_dir: Path, on_progress=None) -> tuple[Path, Path]:
+def ensure_model(model_dir: Path, kind: str = "wd14", on_progress=None):
+    """按模型种类准备文件并返回构造参数。
+
+    - wd14：model.onnx + selected_tags.csv（SmilingWolf wd-vit-v2，356MB）
+    - camie：camie-tagger-v2.onnx + camie-tagger-v2-metadata.json（Camais03，752MB，
+      7 万 Danbooru 标签，角色/作品识别强于 WD14）
+    """
     model_dir.mkdir(parents=True, exist_ok=True)
+    if kind == "camie":
+        onnx = model_dir / "camie-tagger-v2.onnx"
+        meta = model_dir / "camie-tagger-v2-metadata.json"
+        if not onnx.exists() or onnx.stat().st_size < 1024 * 1024:
+            part = model_dir / "camie-tagger-v2.onnx.part"
+            print(f"下载视觉模型 camie-tagger-v2（约 752MB）-> {onnx}")
+            download(CAMIE_MODEL_URL, part, on_progress)
+            part.replace(onnx)
+        if not meta.exists() or meta.stat().st_size < 1024:
+            print("下载 camie 标签元数据…")
+            download(CAMIE_META_URL, meta, on_progress)
+        return onnx, meta
     model = model_dir / "model.onnx"
     tags_csv = model_dir / "selected_tags.csv"
     if not model.exists() or model.stat().st_size < 1024 * 1024:
@@ -154,6 +174,72 @@ class Wd14Model:
             for i, p in enumerate(probs[: len(self.labels)])
             if p >= THRESHOLD
         ]
+
+
+class CamieModel:
+    """camie-tagger-v2 ONNX 推理封装（7 万 Danbooru 标签，角色/作品更强）。
+
+    官方口径：512×512、等比缩放 + ImageNet 均值色填充、ImageNet 归一化、NCHW
+    float32；取 refined 输出过 sigmoid。tag() 返回与 Wd14Model 相同的
+    [(danbooru 名, 概率)]，交由同一受控词表映射。
+    """
+
+    IMG_SIZE = 512
+    PAD_COLOR = (124, 116, 104)  # ImageNet 均值色
+    MEAN = (0.485, 0.456, 0.406)
+    STD = (0.229, 0.224, 0.225)
+    THRESHOLD = 0.35  # 官方默认 0.5；调低多收，交给受控词表过滤
+    KEEP_CATEGORIES = {"general", "character", "copyright", "artist"}
+
+    def __init__(self, model_path: Path, meta_path: Path):
+        import numpy as np
+        import onnxruntime as ort
+
+        self.np = np
+        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        self.input_name = self.session.get_inputs()[0].name
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        mapping = metadata["dataset_info"]["tag_mapping"]
+        self.idx_to_tag: dict[str, str] = mapping["idx_to_tag"]
+        self.tag_to_category: dict[str, str] = mapping["tag_to_category"]
+
+    def tag(self, image_bytes: bytes) -> list[tuple[str, float]]:
+        from io import BytesIO
+
+        from PIL import Image
+
+        np = self.np
+        size = self.IMG_SIZE
+        image = Image.open(BytesIO(image_bytes))
+        if image.mode in ("RGBA", "P", "LA"):
+            image = image.convert("RGB")
+        width, height = image.size
+        if width >= height:
+            new_w, new_h = size, max(1, int(size * height / width))
+        else:
+            new_h, new_w = size, max(1, int(size * width / height))
+        resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (size, size), self.PAD_COLOR)
+        canvas.paste(resized, ((size - new_w) // 2, (size - new_h) // 2))
+
+        arr = np.asarray(canvas, dtype=np.float32) / 255.0
+        arr = (arr - np.array(self.MEAN, dtype=np.float32)) / np.array(self.STD, dtype=np.float32)
+        arr = arr.transpose(2, 0, 1)[None, ...]  # HWC -> NCHW
+
+        outputs = self.session.run(None, {self.input_name: arr})
+        logits = outputs[1] if len(outputs) >= 2 else outputs[0]  # refined 优先
+        probs = 1.0 / (1.0 + np.exp(-logits[0]))
+
+        out: list[tuple[str, float]] = []
+        for idx in np.where(probs >= self.THRESHOLD)[0]:
+            name = self.idx_to_tag.get(str(int(idx)))
+            if not name:
+                continue
+            if self.tag_to_category.get(name, "general") not in self.KEEP_CATEGORIES:
+                continue
+            out.append((name, float(probs[idx])))
+        out.sort(key=lambda x: -x[1])
+        return out
 
 
 def _split_csv_line(line: str) -> list[str]:

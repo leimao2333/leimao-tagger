@@ -28,7 +28,7 @@ import pc_tagger as core
 import source_engine
 import win_dialogs
 
-APP_VERSION = "v1.0.9"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.1.0"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -83,8 +83,14 @@ PAGE = """<!doctype html>
  </div>
  <div class="row">输出文件：<input type="text" id="out" value="__DEFAULT_OUT__"> <button onclick="pick('out','save')">另存为…</button> <span class="muted">打标结果 JSON 的保存位置</span></div>
  <div class="row">
+   视觉模型：<select id="modelKind">
+     <option value="wd14">WD14（经典，356MB）</option>
+     <option value="camie">Camie v2（7万标签，角色/作品强，752MB）</option>
+   </select>
    模型目录：<input type="text" id="model" value="__DEFAULT_MODEL_DIR__" style="width:280px"> <button onclick="pick('model','dir')">浏览…</button>
-   <span class="muted">WD14 模型缓存（约 356MB，首次自动下载）</span>
+   <span class="muted">两种模型各自缓存子目录，首次自动下载（走 hf-mirror）</span>
+ </div>
+ <div class="row">
    下载并发：<input type="text" id="workers" value="6" style="width:40px">
    本轮上限(0=全部)：<input type="text" id="limit" value="0" style="width:60px">
  </div>
@@ -98,7 +104,7 @@ PAGE = """<!doctype html>
    <button id="start" onclick="start()">开始遍历打标</button>
    <button id="stop" class="stop" onclick="stop()" disabled>停止</button>
    <button class="stop" onclick="quitApp()">退出程序</button>
-   <span class="muted">视觉模型约 356MB 首次自动下载；标题解析（作者/汉化组/作品等）每次全量执行</span>
+   <span class="muted">模型首次自动下载走 hf-mirror；标题解析（作者/汉化组/作品等）每次全量执行</span>
  </div>
 </fieldset>
 
@@ -131,7 +137,7 @@ function start(){
     body:JSON.stringify({
       list:v('list'), cloud:v('cloud'), sources:v('sources'),
       srcPages:+v('srcPages')||2, srcType:v('srcType')||'COMIC',
-      out:v('out'), model:v('model'), workers:+v('workers')||6,
+      out:v('out'), model:v('model'), modelKind:v('modelKind'), workers:+v('workers')||6,
       limit:+v('limit')||0, push:document.getElementById('push').checked,
       repo:v('repo'), path:v('path'), token:v('token')
     })}).then(r=>r.json()).then(j=>{ if(!j.ok) alert('启动失败：'+(j.error||'')); });
@@ -396,7 +402,9 @@ class TaggingJob(threading.Thread):
         model = None
         if pending:
             try:
-                log("准备模型（首次下载约 356MB，走 hf-mirror）…")
+                kind = str(self.cfg.get("modelKind") or "wd14")
+                mdir = Path(self.cfg["model"]) / kind
+                log(f"准备模型（{kind}，首次下载走 hf-mirror）…")
                 last_pct = {"v": -5}
 
                 def on_dl(pct: int, done: int, total: int) -> None:
@@ -404,9 +412,13 @@ class TaggingJob(threading.Thread):
                         last_pct["v"] = pct
                         log(f"模型下载：{pct}%（{done // 1048576}MB / {total // 1048576}MB）")
 
-                model_path, tags_csv = core.ensure_model(Path(self.cfg["model"]), on_progress=on_dl)
+                model_path, meta_path = core.ensure_model(mdir, kind=kind, on_progress=on_dl)
                 log("加载 ONNX 模型…")
-                model = core.Wd14Model(model_path, tags_csv)
+                if kind == "camie":
+                    model = core.CamieModel(model_path, meta_path)
+                    log("模型：camie-tagger-v2（7 万标签，角色/作品识别强）")
+                else:
+                    model = core.Wd14Model(model_path, meta_path)
             except Exception as exc:  # noqa: BLE001
                 log(f"模型准备失败：{exc}")
                 STATE.running, STATE.finished = False, True
