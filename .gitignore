@@ -1,0 +1,8 @@
+build_pyi/
+dist*/
+wd14-model/
+__pycache__/
+_ref/
+_realtest*
+*.part
+*.spec

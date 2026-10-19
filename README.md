@@ -1,0 +1,78 @@
+# leimao-tagger · 磊毛阅读 PC 端打标工具
+
+[磊毛阅读](https://github.com/leimao2333/leimao-reader)（Android 聚合阅读 App）的
+PC 端封面打标工具：WD14 ONNX 端侧推理 + 书源直连遍历 + 标题元数据解析，
+产出的打标表推到本仓库 `data/tag_table.json`，
+App 端「设置 → 标签 → 标签导入」（默认 jsDelivr 指向本仓库）即可把打标成果
+幂等合并进本地标签层（同名标签取更高置信度，站方证据不会被覆盖）。
+
+## 功能
+
+- **独立打标，零依赖 App**：只填**书源**即可完整跑通（遍历源站 → 标题解析 →
+  WD14 封面打标 → 输出 / 推送 GitHub）。支持三类源：
+  - **legado / shuyuan 书源**（`bookSourceUrl` + `exploreUrl` + `ruleExplore`，即 xiu2/yuedu 的 shuyuan）；
+  - **App JSON 源规范**（`{name, baseUrl, search:{url, list, fields}}`）；
+  - **MoonTV / MacCMS 采集站**（单站点配置或 `{api_site: {...}}`，按视频收录）。
+
+  JS 源 / Venera 源无法在 PC 端评估，遍历时跳过并记录日志。规则引擎为精简实现
+  （JSONPath 子集 + `selector@attr` / `class.x` / `tag.x` 链式选择 + `{{page}}` 渲染）。
+- **App 备份直读**：收录清单处可直接选 App「备份与恢复」导出的 JSON —— 自动识别，
+  从阅读进度抢救条目（含封面），并把备份里的 legado / MoonTV 源取出来直接遍历。
+- **网络清单**：拉取 GitHub 云端打标表作为基底，与本地清单 / 书源遍历结果合并。
+- **标题解析打标**：参考 [kawayiYokami/MangaReader](https://github.com/kawayiYokami/MangaReader)
+  的 `metadata_parser`，从书名解析 `作者 / 汉化组 / 作品 / 会场 / 平台 / 其他`
+  元数据标签（识别 `[汉化组 (作者)] (C97) [作品名] 标题 [个人汉化]` 惯用命名），
+  以「文本」来源、置信度 60 入库。
+- **原生窗口**：运行后打开原生窗口（WebView2），带文件 / 目录选择对话框；
+  无 WebView2 的环境回退浏览器。模型（约 356MB）首次自动从 hf-mirror 下载，实时进度。
+
+## 文件
+
+| 文件 | 说明 |
+|---|---|
+| `pc_tagger.py` | 核心逻辑 + CLI（Python 3.10+） |
+| `pc_tagger_gui.py` | **窗口版**：原生窗口 + 文件/目录选择，实时进度 / 各源进度表 / 日志，可中途停止 |
+| `source_engine.py` | 网络源遍历引擎：legado 书源 / App JSON 源 / MacCMS 采集站的精简规则引擎 |
+| `gen_vocab.py` | 从 App 源码 `TagAlias.kt` 生成受控词表 `vocab.json`（词表改动后重跑） |
+| `vocab.json` | 受控词表（danbooru/english → 中文规范名），PC 端映射口径 |
+| `data/tag_table.json` | 云端打标表（App「标签导入」的默认地址） |
+| `requirements.txt` | Python 依赖 |
+
+## 使用
+
+### exe（推荐）
+
+从 [Releases](https://github.com/leimao2333/leimao-tagger/releases) 下载
+`leimao-pc-tagger.exe`，双击运行 —— 词表已内置，单文件即用（外置同名 `vocab.json`
+优先，可自定义映射口径）。
+
+1. 「书源导入」填书源文件 / 网址（多个用 `|` 分隔），或「收录清单」选 App 备份 / 打标表；
+2. 点「开始遍历打标」；「输出文件」「模型目录」留空即用 exe 同目录默认值；
+3. 勾选「打标后推送 GitHub」可直接更新云端表（Token 可选，留空用环境变量 `GH_TOKEN`）。
+
+### CLI
+
+```bash
+pip install -r requirements.txt
+
+# 直接用 App 备份文件（自动识别内嵌源 + 进度条目）
+python pc_tagger.py --list leimao-backup.json --out tag_table.json
+
+# 或只用书源文件遍历
+python pc_tagger.py --sources shuyuan.json --src-type COMIC --src-pages 2
+
+# 推送到本仓库（App 端「标签导入」即可拉取）
+python pc_tagger.py --cloud --out tag_table.json --push --token ghp_xxx
+```
+
+参数：`--cloud [URL]` 网络清单；`--limit N` 本轮最多打标条数；`--workers N` 封面下载并发；
+`--model-dir` 模型缓存目录；`--vocab` 词表路径；`--token` 也可用环境变量 `GH_TOKEN`。
+
+## 打包 exe
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller --onefile --windowed --name leimao-pc-tagger ^
+  --add-data "vocab.json;." --collect-all webview pc_tagger_gui.py
+# 产物 dist/leimao-pc-tagger.exe
+```
