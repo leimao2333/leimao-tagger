@@ -1,0 +1,19 @@
+{
+  "latest": "tag_table.json",
+  "generatedAt": 1792416477320,
+  "updatedAt": 1792418669196,
+  "count": 20295,
+  "taggedCount": 17563,
+  "bytes": 10997930,
+  "sha256": "1cae24d1a8b8bb781fc770f2262b55e63d97408c22a4d060d0b4dcc777e44bdc",
+  "types": {
+    "NOVEL": 16691,
+    "COMIC": 782,
+    "VIDEO": 2822
+  },
+  "sources": 148,
+  "archive": [
+    "archive/tag_table-20261019-220428.json.gz"
+  ],
+  "note": "App 设置 → 标签 → 标签导入 → 云端，先读本文件判断版本，再决定是否下载 tag_table.json"
+}

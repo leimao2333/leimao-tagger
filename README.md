@@ -36,7 +36,29 @@ App 端「设置 → 标签 → 标签导入」（默认 jsDelivr 指向本仓�
 | `gen_vocab.py` | 从 App 源码 `TagAlias.kt` 生成受控词表 `vocab.json`（词表改动后重跑） |
 | `vocab.json` | 受控词表（danbooru/english → 中文规范名），PC 端映射口径 |
 | `data/tag_table.json` | 云端打标表（App「标签导入」的默认地址） |
+| `data/manifest.json` | 云端版本清单：条数 / 生成时间 / sha256 / 各类型分布 / 归档列表 |
+| `data/archive/` | 历次发布归档（gzip，默认保留最近 20 份） |
+| `publish_tags.py` | **发布脚本**：把一份打标表变成云端最新版（紧凑化 + 归档 + 写 manifest） |
 | `requirements.txt` | Python 依赖 |
+
+## 更新云端标签表（App 不用发版）
+
+App 的「设置 → 标签 → 标签导入 → 云端」读的是 `data/manifest.json` 这个**固定地址**：
+先拿清单（几 KB）比对版本，只有云端比本地新才去下载 11MB 的表。所以更新数据完全不用改 App、
+不用发 Release，只要把新数据推上去：
+
+```bash
+# 1. 用新导出的打标表更新云端（自动紧凑化 + 归档 + 重写 manifest）
+python publish_tags.py 新导出的表.json
+
+# 2. 推上去
+git add data && git commit -m "data: 更新打标表" && git push origin main
+```
+
+之后在 App 里点「云端 → 检查更新 → 导入」即可。jsDelivr 有分钟级缓存，推完等 1~2 分钟再拉。
+
+- `--keep N`：归档保留份数（默认 20），超出自动删最旧的，避免仓库被历史数据撑大。
+- 也可以直接让 PC 工具带 `--push` 推送，效果等价（脚本只是把同样的几步做成一条命令）。
 
 ## 使用
 
