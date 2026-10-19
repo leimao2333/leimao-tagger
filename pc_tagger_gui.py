@@ -26,6 +26,8 @@ from pathlib import Path
 import pc_tagger as core
 import source_engine
 
+APP_VERSION = "v1.0.1"  # 界面标题栏可见，用于区分新旧 exe
+
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -47,7 +49,7 @@ def resource_path(name: str) -> str:
 
 PAGE = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
-<title>磊毛阅读 · PC 端封面打标</title>
+<title>磊毛阅读 · PC 端封面打标 __VER__</title>
 <style>
  body{font-family:"Microsoft YaHei",sans-serif;margin:24px;max-width:960px;color:#222}
  h1{font-size:20px} fieldset{border:1px solid #ccc;border-radius:8px;margin-bottom:14px}
@@ -66,7 +68,7 @@ PAGE = """<!doctype html>
       overflow:auto;border-radius:6px;padding:8px;white-space:pre-wrap}
  .muted{color:#777;font-size:12px}
 </style></head><body>
-<h1>磊毛阅读 · PC 端封面打标</h1>
+<h1>磊毛阅读 · PC 端封面打标 <span class="muted">__VER__</span></h1>
 
 <fieldset><legend>配置</legend>
  <div class="row">收录清单：<input type="text" id="list"> <button onclick="pick('list','file')">浏览…</button> <span class="muted">App 导出的 tag_table.json 或「备份与恢复」的备份 JSON（自动识别）</span></div>
@@ -155,7 +157,10 @@ function poll(){ fetch('/api/status').then(r=>r.json()).then(render).catch(()=>{
 poll(); timer=setInterval(poll,800);
 </script></body></html>"""
 
-PAGE = PAGE.replace("__DEFAULT_OUT__", DEFAULT_OUT).replace("__DEFAULT_MODEL_DIR__", DEFAULT_MODEL_DIR)
+PAGE = (PAGE
+        .replace("__DEFAULT_OUT__", DEFAULT_OUT)
+        .replace("__DEFAULT_MODEL_DIR__", DEFAULT_MODEL_DIR)
+        .replace("__VER__", APP_VERSION))
 
 
 class State:
@@ -485,7 +490,7 @@ def main() -> None:
         return
     api = PickerApi()
     window = webview.create_window(
-        "磊毛阅读 · PC 端封面打标", url, js_api=api,
+        f"磊毛阅读 · PC 端封面打标 {APP_VERSION}", url, js_api=api,
         width=1150, height=940, min_size=(880, 680),
     )
     api.bind(window)
