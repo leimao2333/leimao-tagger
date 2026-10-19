@@ -27,7 +27,7 @@ from pathlib import Path
 import pc_tagger as core
 import source_engine
 
-APP_VERSION = "v1.0.2"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.0.3"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -495,6 +495,8 @@ def main() -> None:
     except Exception:  # noqa: BLE001
         pass  # 连不上 = 没有实例，继续正常启动
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    # 关键：后台线程里启动 HTTP 服务（此前原生窗口分支漏掉 serve_forever，导致白屏）
+    threading.Thread(target=server.serve_forever, daemon=True, name="http-server").start()
     print(f"磊毛阅读 PC 打标工具已启动：{url} （关闭窗口即退出）")
     # 优先原生窗口（pywebview / WebView2），打包环境没有就回退浏览器
     try:
@@ -502,7 +504,7 @@ def main() -> None:
     except Exception:  # noqa: BLE001
         webbrowser.open(url)
         try:
-            server.serve_forever()
+            threading.Event().wait()  # HTTP 服务已在后台线程运行，挂住主线程即可
         except KeyboardInterrupt:
             pass
         os._exit(0)
