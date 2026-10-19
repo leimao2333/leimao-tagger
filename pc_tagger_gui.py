@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import sys
 import threading
 import time
@@ -27,8 +26,9 @@ from pathlib import Path
 
 import pc_tagger as core
 import source_engine
+import win_dialogs
 
-APP_VERSION = "v1.0.4"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.0.5"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -144,12 +144,18 @@ function quitApp(){
 function v(id){ return document.getElementById(id).value.trim(); }
 function render(s){
   document.getElementById('obar').style.width=(s.total? s.done*100/s.total:100)+'%';
-  document.getElementById('otext').textContent=s.done+' / '+s.total+'（命中 '+s.hit+'）';
+  if(s.phase==='traverse'){
+    document.getElementById('otext').textContent='遍历源 '+s.done+' / '+s.total+'（已收录 '+s.hit+' 部）';
+  }else if(s.phase==='tag'){
+    document.getElementById('otext').textContent='视觉打标 '+s.done+' / '+s.total+'（命中 '+s.hit+'）';
+  }else{
+    document.getElementById('otext').textContent=s.done+' / '+s.total+'（命中 '+s.hit+'）';
+  }
   document.getElementById('stext').innerHTML='<b>当前源：'+(s.current||'—')+'</b>';
   const src=s.sources||{}; const names=Object.keys(src);
-  const tb='<tr><th>源</th><th>封面数</th><th>已打标</th><th>进度</th></tr>'+
+  const tb='<tr><th>源</th><th>页/封面数</th><th>已完成</th><th>进度</th></tr>'+
     names.map(n=>{const x=src[n];const p=x.total?Math.round(x.done*100/x.total):100;
-      return '<tr><td>'+n+'</td><td>'+x.total+'</td><td>'+x.hit+'</td><td>'+x.done+'/'+x.total+'（'+p+'%）</td></tr>';}).join('');
+      return '<tr><td>'+n+'</td><td>'+x.total+'</td><td>'+x.done+'（'+x.hit+'）</td><td>'+x.done+'/'+x.total+'（'+p+'%）</td></tr>';}).join('');
   document.getElementById('sources').innerHTML=tb;
   document.getElementById('sbar').style.width=(s.total? s.done*100/s.total:100)+'%';
   const log=document.getElementById('log');
@@ -177,6 +183,7 @@ class State:
         self.log_version = 0
         self.running = False
         self.finished = False
+        self.phase = "idle"  # idle / traverse（遍历源）/ tag（视觉打标）
         self.done = 0
         self.total = 0
         self.hit = 0
@@ -194,6 +201,7 @@ class State:
             return {
                 "running": self.running,
                 "finished": self.finished,
+                "phase": self.phase,
                 "done": self.done,
                 "total": self.total,
                 "hit": self.hit,
@@ -268,19 +276,39 @@ class TaggingJob(threading.Thread):
                 except Exception as exc:  # noqa: BLE001
                     log(f"书源装载失败 {spec[:60]}：{exc}")
             log(f"待遍历源合计：{len(pending_sources)} 个（每分类抓 {src_pages} 页）")
+            with STATE.lock:
+                STATE.phase = "traverse"
+                STATE.total = len(pending_sources)
+                STATE.done = 0
+                STATE.hit = 0
             for source in pending_sources:
                 if STATE.stop_event.is_set():
                     break
                 log(f"遍历源：{source.name}（{type(source).__name__}）")
+                with STATE.lock:
+                    STATE.current = source.name
+
+                def on_progress(done_pages: int, total_pages: int, items_found: int,
+                                _name: str = source.name) -> None:
+                    # 每页回调：实时刷新该源进度条（页数维度）
+                    with STATE.lock:
+                        row = STATE.sources.setdefault(_name, {"total": 0, "done": 0, "hit": 0})
+                        row["total"] = total_pages
+                        row["done"] = done_pages
+                        row["hit"] = items_found
+
                 try:
-                    found = source.explore(src_pages, log)
+                    found = source.explore(src_pages, log, progress=on_progress)
                 except Exception as exc:  # noqa: BLE001
                     log(f"  ✗ 遍历失败 {source.name}：{exc}")
                     found = []
                 with STATE.lock:
-                    STATE.sources[f"[遍历] {source.name}"] = {
-                        "total": len(found), "done": len(found), "hit": len(found),
-                    }
+                    STATE.done += 1
+                    STATE.hit += len(found)
+                    row = STATE.sources.setdefault(source.name, {"total": 0, "done": 0, "hit": 0})
+                    row["total"] = max(row["total"], 1)
+                    row["done"] = row["total"]  # 该源完成：进度条拉满
+                    row["hit"] = len(found)
                 if found:
                     items = core.merge_items(items, found)
                     log(f"  {source.name}：收录 {len(found)} 部，合并后共 {len(items)} 条")
@@ -316,13 +344,15 @@ class TaggingJob(threading.Thread):
         for item in pending:
             by_source[item.get("sourceName") or item.get("sourceId") or "未知源"].append(item)
         with STATE.lock:
+            STATE.phase = "tag"
             STATE.total = len(pending)
             STATE.done = 0
             STATE.hit = 0
-            STATE.sources = {
-                name: {"total": len(items_), "done": 0, "hit": 0}
-                for name, items_ in by_source.items()
-            }
+            # 打标阶段不覆盖遍历阶段的每源行，加前缀区分、各自独立进度条
+            for name, items_ in by_source.items():
+                STATE.sources[f"[打标] {name}"] = {
+                    "total": len(items_), "done": 0, "hit": 0,
+                }
         log(f"待视觉打标：{len(pending)} 部，分布在 {len(by_source)} 个源")
 
         model = None
@@ -351,6 +381,7 @@ class TaggingJob(threading.Thread):
                 break
             with STATE.lock:
                 STATE.current = source_name
+            row_key = f"[打标] {source_name}"
             for index, item in enumerate(source_items):
                 if STATE.stop_event.is_set():
                     stopped = True
@@ -375,11 +406,13 @@ class TaggingJob(threading.Thread):
                     )
                     hit += 1
                 with STATE.lock:
-                    src = STATE.sources[source_name]
-                    src["done"] = index + 1
+                    src = STATE.sources.get(row_key)
+                    if src is not None:
+                        src["done"] = index + 1
                     STATE.done += 1
                     if hit:
-                        src["hit"] += 1
+                        if src is not None:
+                            src["hit"] += 1
                         STATE.hit += 1
                         item["tags"] = sorted(merged.values(), key=lambda t: -t["confidence"])
                     log(f"  {'✓ ' + title + f'（{hit} 个受控标签）' if hit else '– ' + title + '：无可映射标签'}")
@@ -466,6 +499,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.log_version += 1
                 STATE.finished = False
                 STATE.running = True
+                STATE.phase = "idle"
                 STATE.stop_event.clear()
             cfg["vocab"] = resource_path("vocab.json")
             TaggingJob(cfg).start()
@@ -474,14 +508,18 @@ class Handler(BaseHTTPRequestHandler):
             STATE.stop_event.set()
             self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
         elif self.path == "/api/pick":
-            # 调起 Windows 原生文件/目录对话框（tkinter），替代已废弃的 pywebview js_api
+            # 直接调 Windows 系统对话框（comdlg32/shell32），自带模态循环，可在线程中调用
             try:
                 req = json.loads(body or b"{}")
-                path = DIALOGS.ask(
-                    str(req.get("kind") or "file"),
-                    str(req.get("title") or "选择"),
-                    str(req.get("def") or ""),
-                )
+                kind = str(req.get("kind") or "file")
+                title = str(req.get("title") or "选择")
+                default = str(req.get("def") or "")
+                if kind == "dir":
+                    path = win_dialogs.pick_dir(title)
+                elif kind == "save":
+                    path = win_dialogs.pick_save(default or "tag_table.json")
+                else:
+                    path = win_dialogs.pick_file(title)
                 payload = {"ok": True, "path": path}
             except Exception as exc:  # noqa: BLE001
                 payload = {"ok": False, "path": "", "error": str(exc)}
@@ -516,78 +554,14 @@ def main() -> None:
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     print(f"磊毛阅读 PC 打标工具已启动：{url} （在浏览器页面点「退出程序」即退出）")
     # v1.0.4：pywebview 原生窗口在本机 UI 自动化环境下会被卡死（AccessibilityObject
-    # 递归风暴），改用默认浏览器显示界面；文件/目录选择用 tkinter 原生对话框，体验不变。
-    DIALOGS.start()
+    # 递归风暴），改用默认浏览器显示界面；文件/目录选择用 Windows 系统对话框
+    # （comdlg32/shell32，纯 ctypes），弹窗必定可用。
     webbrowser.open(url)
     try:
         threading.Event().wait()  # 挂住主线程；退出由「退出程序」/看守线程触发
     except KeyboardInterrupt:
         pass
-    os._exit(0)
-
-
-class DialogService:
-    """tkinter 原生文件/目录对话框服务（专用线程 + 事件循环）。
-
-    浏览器页面点「浏览…」→ /api/pick → ask() 投递请求并等待 → 对话框线程弹出
-    真正的 Windows 选择窗口 → 返回所选路径。
-    """
-
-    def __init__(self) -> None:
-        self.q: "queue.Queue[tuple]" = queue.Queue()
-        self.ready = threading.Event()
-
-    def start(self) -> None:
-        threading.Thread(target=self._run, daemon=True, name="tk-dialogs").start()
-        self.ready.wait(10)
-
-    def _run(self) -> None:
-        try:
-            import tkinter as tk  # noqa: PLC0415
-            from tkinter import filedialog  # noqa: PLC0415
-        except Exception:  # noqa: BLE001  没有.tk（罕见）：浏览按钮退化为手动输入
-            self.ready.set()
-            return
-        root = tk.Tk()
-        root.withdraw()  # 只用对话框，不显示主窗口
-
-        def poll() -> None:
-            try:
-                kind, title, default, box = self.q.get_nowait()
-            except queue.Empty:
-                root.after(120, poll)
-                return
-            try:
-                root.attributes("-topmost", True)
-                if kind == "dir":
-                    r = filedialog.askdirectory(title=title, parent=root)
-                elif kind == "save":
-                    r = filedialog.asksaveasfilename(
-                        title=title, initialfile=default or "tag_table.json", parent=root)
-                else:
-                    r = filedialog.askopenfilename(title=title, parent=root)
-                root.attributes("-topmost", False)
-            except Exception:  # noqa: BLE001
-                r = ""
-            box["v"] = r
-            box["done"].set()
-            root.after(120, poll)
-
-        root.after(120, poll)
-        self.ready.set()
-        root.mainloop()
-
-    def ask(self, kind: str, title: str, default: str = "") -> str:
-        """阻塞直到用户在原生对话框里做出选择（HTTP 线程调用）。"""
-        if not self.ready.is_set():
-            return ""
-        box: dict = {"done": threading.Event(), "v": ""}
-        self.q.put((kind, title, default, box))
-        box["done"].wait(600)  # 对话框最多等 10 分钟
-        return box["v"]
-
-
-DIALOGS = DialogService()
+        os._exit(0)
 
 _LAST_POLL = {"t": time.time()}
 

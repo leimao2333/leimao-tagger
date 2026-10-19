@@ -254,7 +254,8 @@ class BaseSource:
     source_id = ""
     item_type = "COMIC"
 
-    def explore(self, pages: int, log) -> list[TraversedItem]:
+    def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
+        """遍历源；progress(done_pages, total_pages, items_found) 每页回调一次（UI 进度）。"""
         raise NotImplementedError
 
 
@@ -280,7 +281,7 @@ class LegadoSource(BaseSource):
                 h = {}
         self.search_headers = h if isinstance(h, dict) else {}
 
-    def explore(self, pages: int, log) -> list[TraversedItem]:
+    def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
         if not self.categories:
             log(f"  跳过：exploreUrl 为空或含 @js（{self.name}）")
             return []
@@ -293,6 +294,10 @@ class LegadoSource(BaseSource):
             "author": self.rule_explore.get("author") or "",
             "detailUrl": self.rule_explore.get("bookUrl") or "",
         }
+        total_pages = sum(
+            (pages if "{{" in tpl else 1) for _, tpl in self.categories
+        )
+        done_pages = 0
         found: dict[str, TraversedItem] = {}
         for title, cat_tpl in self.categories:
             has_page = "{{" in cat_tpl
@@ -322,6 +327,12 @@ class LegadoSource(BaseSource):
                         title=t, cover=cover, sourceName=self.name,
                     )
                     fresh += 1
+                done_pages += 1
+                if progress:
+                    try:
+                        progress(done_pages, max(total_pages, 1), len(found))
+                    except Exception:  # noqa: BLE001
+                        pass
                 log(f"  {self.name}「{title}」第 {page} 页：+{fresh}")
                 if page > 1 and not rows:
                     break
@@ -364,7 +375,7 @@ class AppJsonSource(BaseSource):
         self.fields = search.get("fields") or {}
         self.headers = search.get("headers") or {}
 
-    def explore(self, pages: int, log) -> list[TraversedItem]:
+    def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
         if not self.url_tpl:
             log(f"  跳过：search.url 缺失（{self.name}）")
             return []
@@ -376,7 +387,9 @@ class AppJsonSource(BaseSource):
             return []
         found: dict[str, TraversedItem] = {}
         has_page = "{{" in self.url_tpl
-        for page in range(1, (pages if has_page else 1) + 1):
+        total_pages = pages if has_page else 1
+        done_pages = 0
+        for page in range(1, total_pages + 1):
             url = render_url(self.url_tpl, page)
             if not url:
                 break
@@ -402,6 +415,12 @@ class AppJsonSource(BaseSource):
                     title=t, cover=cover, sourceName=self.name,
                 )
                 fresh += 1
+            done_pages += 1
+            if progress:
+                try:
+                    progress(done_pages, total_pages, len(found))
+                except Exception:  # noqa: BLE001
+                    pass
             log(f"  {self.name} 第 {page} 页：+{fresh}")
             if not rows:
                 break
@@ -418,7 +437,7 @@ class MacCmsSource(BaseSource):
         self.detail = detail.rstrip("/")
         self.item_type = "VIDEO"
 
-    def explore(self, pages: int, log) -> list[TraversedItem]:
+    def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
         found: dict[str, TraversedItem] = {}
         for page in range(1, pages + 1):
             url = f"{self.api}?ac=videolist&pg={page}"
@@ -444,6 +463,11 @@ class MacCmsSource(BaseSource):
                     title=t, cover=pic, sourceName=self.name,
                 )
                 fresh += 1
+            if progress:
+                try:
+                    progress(page, pages, len(found))
+                except Exception:  # noqa: BLE001
+                    pass
             log(f"  {self.name} 第 {page} 页：+{fresh}")
             if page >= int(data.get("page", {}).get("pagecount", 1) if isinstance(data.get("page"), dict) else 1):
                 break
