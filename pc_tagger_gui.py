@@ -16,6 +16,7 @@ v1.8.1.8：原生窗口 + 文件/目录选择对话框（pywebview js_api）；�
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -26,7 +27,7 @@ from pathlib import Path
 import pc_tagger as core
 import source_engine
 
-APP_VERSION = "v1.0.1"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.0.2"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -95,6 +96,7 @@ PAGE = """<!doctype html>
  <div class="row">
    <button id="start" onclick="start()">开始遍历打标</button>
    <button id="stop" class="stop" onclick="stop()" disabled>停止</button>
+   <button class="stop" onclick="quitApp()">退出程序</button>
    <span class="muted">视觉模型约 356MB 首次自动下载；标题解析（作者/汉化组/作品等）每次全量执行</span>
  </div>
 </fieldset>
@@ -136,6 +138,10 @@ function start(){
     })}).then(r=>r.json()).then(j=>{ if(!j.ok) alert('启动失败：'+(j.error||'')); });
 }
 function stop(){ fetch('/api/stop',{method:'POST'}); }
+function quitApp(){
+  if(!confirm('确定退出程序？未完成的打标会中断。')) return;
+  fetch('/api/quit',{method:'POST'});
+}
 function v(id){ return document.getElementById(id).value.trim(); }
 function render(s){
   document.getElementById('obar').style.width=(s.total? s.done*100/s.total:100)+'%';
@@ -466,6 +472,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/stop":
             STATE.stop_event.set()
             self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
+        elif self.path == "/api/quit":
+            self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
+            os._exit(0)  # 无论哪种模式（原生窗口/浏览器回退）都立即彻底退出
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -475,10 +484,19 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     port = 8765
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}/"
+    # 单实例保护：已有实例在跑就直接打开其页面并退出，避免堆积后台进程
+    try:
+        import urllib.request  # noqa: PLC0415
+        urllib.request.urlopen(url, timeout=0.6)
+        webbrowser.open(url)
+        print("已有实例在运行，已在浏览器打开其页面；本进程退出。")
+        return
+    except Exception:  # noqa: BLE001
+        pass  # 连不上 = 没有实例，继续正常启动
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"磊毛阅读 PC 打标工具已启动：{url} （关闭窗口即退出）")
-    # v1.8.1.8：优先原生窗口（pywebview / WebView2），打包环境没有就回退浏览器
+    # 优先原生窗口（pywebview / WebView2），打包环境没有就回退浏览器
     try:
         import webview  # noqa: PLC0415
     except Exception:  # noqa: BLE001
@@ -487,14 +505,17 @@ def main() -> None:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
-        return
+        os._exit(0)
     api = PickerApi()
     window = webview.create_window(
         f"磊毛阅读 · PC 端封面打标 {APP_VERSION}", url, js_api=api,
         width=1150, height=940, min_size=(880, 680),
     )
     api.bind(window)
-    webview.start()  # 阻塞直到窗口关闭，守护线程随进程退出
+    webview.start()  # 阻塞直到窗口关闭
+    # 窗口已关闭：停掉服务并强制退出，绝不留后台进程
+    server.shutdown()
+    os._exit(0)
 
 
 class PickerApi:
