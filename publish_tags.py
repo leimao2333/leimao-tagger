@@ -25,17 +25,36 @@ import gzip
 import hashlib
 import json
 import os
-import subprocess
 import sys
+import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 ARCHIVE = os.path.join(DATA, "archive")
 
+CDN_PURGE = "https://purge.jsdelivr.net/gh/leimao2333/leimao-tagger@main/data/"
+
 
 def fail(msg: str) -> "None":
     print(f"[x] {msg}")
     sys.exit(1)
+
+
+def purge_cdn() -> None:
+    """清 jsDelivr 上固定名文件的缓存。
+
+    jsDelivr 按 URL 缓存最长 7 天（`Cache-Control: max-age=604800`），
+    而且**忽略 query string** —— 加 `?t=` 骗不过它。覆盖同名文件后必须调这个
+    官方 purge 接口，否则 App 会连着几天读到旧内容（实测读到占位空表 → 导入 0 条）。
+    带时间戳的 `tag_table-<stamp>.json` 是新 URL，本来就没有旧缓存，不需要 purge。
+    """
+    for name in ("manifest.json", "tag_table.json"):
+        url = CDN_PURGE + name
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                print(f"[ok] purge {name}: HTTP {resp.status}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[!] purge {name} 失败：{exc}（App 会滞后，稍后手动重试）")
 
 
 def summarize(items: list[dict]) -> dict:
@@ -53,11 +72,22 @@ def summarize(items: list[dict]) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="发布打标表到 data/tag_table.json")
-    ap.add_argument("input", help="打标表 JSON 路径（App 导出 / PC 工具产出）")
+    ap.add_argument("input", nargs="?", help="打标表 JSON 路径（App 导出 / PC 工具产出）")
     ap.add_argument("--keep", type=int, default=20, help="归档保留份数（默认 20）")
+    ap.add_argument(
+        "--purge",
+        action="store_true",
+        help="只清 jsDelivr 缓存（要在 git push 之后跑，否则清的是还没生效的旧文件）",
+    )
     ap.add_argument("--no-push", action="store_true", help="只落盘，不打印 git 提示")
     args = ap.parse_args()
 
+    if args.purge:
+        purge_cdn()
+        return
+
+    if not args.input:
+        fail("缺少输入文件（或改用 --purge 只清缓存）")
     if not os.path.isfile(args.input):
         fail(f"找不到输入文件：{args.input}")
 
@@ -133,10 +163,11 @@ def main() -> None:
     print(f"[ok] manifest 已更新，归档共 {len(kept)} 份")
 
     if not args.no_push:
-        print("\n接下来：")
+        print("\n接下来（三步都要，第二步之后才能 purge）：")
         print("  git add data && git commit -m \"data: 更新打标表 %s\"" % stamp)
         print("  git push origin main")
-        print("  之后 App 里点「云端」即可导入（jsDelivr 有分钟级缓存，等 1~2 分钟）")
+        print("  python publish_tags.py --purge      # 清 jsDelivr 固定名缓存，App 才能立刻看到")
+        print("  之后 App 里点「云端」即可导入")
 
 
 if __name__ == "__main__":

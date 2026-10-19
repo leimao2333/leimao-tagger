@@ -53,15 +53,19 @@ python publish_tags.py 新导出的表.json
 
 # 2. 推上去
 git add data && git commit -m "data: 更新打标表" && git push origin main
+
+# 3. 清 jsDelivr 缓存（必须，否则 App 可能连续几天读到旧内容）
+python publish_tags.py --purge
 ```
 
-之后在 App 里点「云端 → 检查更新 → 导入」即可。jsDelivr 有分钟级缓存，推完等 1~2 分钟再拉。
+之后在 App 里点「云端 → 导入」即可，**不需要等**。
 
-- **为什么 latest 是 `tag_table-<时间戳>.json` 而不是固定名**：jsDelivr 按 URL 缓存，最长 7 天
-  （`Cache-Control: max-age=604800`）。如果一直覆盖同一个 `tag_table.json`，App 会连续几天拿到旧内容
-  —— 实测刚推完仍然读到占位空表，App 里显示「云端 0 条」。换成每次新文件名后，新 URL 没有旧缓存可命中，
-  推完立刻生效。`data/tag_table.json` 仍然同步覆盖，只为兼容只认固定名的旧版 App。
-- App 下载后会拿清单里的 `count` 校验条数，不符就报「可能是 CDN 缓存未刷新」，不会静默导入一份空表。
+- **为什么 latest 是 `tag_table-<时间戳>.json` 而不是固定名**：jsDelivr 按 URL 缓存最长 7 天
+  （`Cache-Control: max-age=604800`），而且**忽略 `?t=` 这类 query 参数**。如果一直覆盖同一个
+  `tag_table.json`，实测刚推完 App 仍读到占位空表，界面显示「云端 0 条」。换成新文件名后，新 URL
+  没有旧缓存可命中，推完立刻生效。`data/tag_table.json` 仍同步覆盖，只为兼容只认固定名的旧版 App。
+- 固定名那两个文件（`manifest.json` / `tag_table.json`）更新后必须 `--purge`，否则 CDN 还给旧内容。
+- App 下载后会拿清单里的 `count` 校验条数，不符就报「可能是 CDN 缓存还没刷新」，不会静默导入空表。
 - `--keep N`：归档保留份数（默认 20），超出自动删最旧的；带时间戳的表只留最近 2 份，避免仓库每次多 11MB。
 - 也可以直接让 PC 工具带 `--push` 推送，效果等价（脚本只是把同样的几步做成一条命令）。
 
