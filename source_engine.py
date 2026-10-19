@@ -21,7 +21,11 @@ JS 源 / Venera 源无法在 PC 端评估，遍历时记录日志后跳过。
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
+import sys
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
@@ -530,9 +534,202 @@ class MacCmsSource(BaseSource):
 # ---------------------------------------------------------------- 装载
 
 
+class VeneraSource(BaseSource):
+    """Venera JS 漫画源（extends ComicSource）：node 子进程执行 venera_runner.js。
+
+    runner 通过 NODE_PATH 加载 cheerio，shim 官方 _venera_.js API 面
+    （Network / HtmlDocument / Comic / Convert / loadSetting / loadData 等）。
+    pages <= 0 时抓全部页（以 maxPage 与空页为准，200 页保险上限）。
+    """
+
+    _MAX_PAGES_UNLIMITED = 200  # 全量模式单分类保险上限，防止站点无限翻页
+
+    def __init__(self, raw: str, item_type: str = "COMIC"):
+        self.raw = raw
+        self.item_type = item_type
+        self.name = "Venera源"
+        self.source_id = ""
+        self._probed = False
+
+    # ---------- node / runner ----------
+    @staticmethod
+    def _find_node() -> str | None:
+        exe = "node.exe" if os.name == "nt" else "node"
+        # 1) PyInstaller 解包目录（--add-binary 打包的 node）
+        mei = getattr(sys, "_MEIPASS", None)
+        if mei and os.path.isfile(os.path.join(mei, exe)):
+            return os.path.join(mei, exe)
+        # 2) exe 同目录 / 脚本目录
+        for base in (os.path.dirname(os.path.abspath(sys.argv[0])),
+                     os.path.dirname(os.path.abspath(__file__))):
+            p = os.path.join(base, exe)
+            if os.path.isfile(p):
+                return p
+        # 3) PATH
+        w = shutil.which("node")
+        if w:
+            return w
+        # 4) 常见固定路径
+        for p in (
+            r"C:\Program Files\nodejs\node.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\node.exe"),
+        ):
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _runner_path(self) -> str:
+        base = os.path.dirname(os.path.abspath(__file__))
+        mei = getattr(sys, "_MEIPASS", None)
+        for d in (mei, base):
+            if d and os.path.isfile(os.path.join(d, "venera_runner.js")):
+                return os.path.join(d, "venera_runner.js")
+        return os.path.join(base, "venera_runner.js")
+
+    def _run(self, job: dict, log) -> dict | None:
+        node = self._find_node()
+        if not node:
+            log(f"  ✗ {self.name}：未找到 node.exe，Venera 源需要 Node 运行时")
+            return None
+        env = {**os.environ}
+        # cheerio 所在目录（打包/开发两种布局都试）
+        base = os.path.dirname(os.path.abspath(__file__))
+        mei = getattr(sys, "_MEIPASS", None)
+        for d in (mei, base):
+            nm = os.path.join(d, "node_modules") if d else ""
+            if nm and os.path.isdir(nm):
+                env["NODE_PATH"] = os.pathsep.join(
+                    x for x in (env.get("NODE_PATH", ""), nm) if x)
+                break
+        # 代理变量可能指向坏代理，直接绕过
+        for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+            env.pop(k, None)
+        env["NO_PROXY"] = env.pop("NO_PROXY", "*") or "*"
+        try:
+            p = subprocess.run(
+                [node, self._runner_path(), self._cfg_path(), json.dumps(job)],
+                capture_output=True, timeout=90, env=env,
+                text=True, encoding="utf-8", errors="replace",
+            )
+        except subprocess.TimeoutExpired:
+            log(f"  ✗ {self.name}：runner 超时（90s）")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log(f"  ✗ {self.name}：runner 启动失败：{exc}")
+            return None
+        line = ""
+        for l in (p.stdout or "").strip().splitlines():
+            l = l.strip()
+            if l.startswith("{"):
+                line = l  # 取最后一行 JSON
+        if not line:
+            return None
+        try:
+            return json.loads(line)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _cfg_path(self) -> str:
+        if getattr(self, "_cfg_file", None):
+            return self._cfg_file
+        import tempfile
+        fd, p = tempfile.mkstemp(prefix="venera_", suffix=".js")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(self.raw)
+        self._cfg_file = p
+        return p
+
+    def _probe(self, log) -> bool:
+        """info 模式：拿 name/key/explore 条目数。"""
+        if self._probed:
+            return True
+        r = self._run({"mode": "info"}, log)
+        if not r or not r.get("ok"):
+            log(f"  ✗ {self.name}：配置加载失败（{r.get('error') if r else '无输出'}）")
+            return False
+        self.name = r.get("name") or self.name
+        self.source_id = f"venera:{r.get('key') or self.name}"
+        self._entries = int(r.get("entries") or 0)
+        self._probed = True
+        return self._entries > 0
+
+    def __del__(self):
+        try:
+            if getattr(self, "_cfg_file", None) and os.path.isfile(self._cfg_file):
+                os.remove(self._cfg_file)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------- 遍历 ----------
+    def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
+        if not self._probe(log):
+            if not self._probed:
+                return []
+            log(f"  跳过：{self.name} 无 explore 条目")
+            return []
+        unlimited = pages <= 0
+        found: dict[str, TraversedItem] = {}
+        done_pages = 0
+        for entry in range(self._entries):
+            page = 0
+            stale = 0
+            while True:
+                page += 1
+                if not unlimited and page > pages:
+                    break
+                if unlimited and page > self._MAX_PAGES_UNLIMITED:
+                    log(f"  {self.name} entry{entry} 达 {self._MAX_PAGES_UNLIMITED} 页上限，停止")
+                    break
+                r = self._run({"mode": "explore", "entry": entry, "page": page}, log)
+                if not r or not r.get("ok"):
+                    log(f"  ✗ {self.name} entry{entry} 第 {page} 页：{r.get('error') if r else '无输出'}")
+                    break
+                comics = r.get("comics") or []
+                fresh = 0
+                fp = []
+                for c in comics:
+                    t = (c.get("title") or "").strip()
+                    cover = (c.get("cover") or "").strip()
+                    cid = (c.get("id") or "").strip()
+                    if not t or not cover:
+                        continue
+                    key = cid or t
+                    fp.append(key)
+                    if key in found:
+                        continue
+                    found[key] = TraversedItem(
+                        sourceId=self.source_id, itemId=cid or t, itemType=self.item_type,
+                        title=t, cover=cover, sourceName=self.name,
+                    )
+                    fresh += 1
+                done_pages += 1
+                if progress:
+                    try:
+                        progress(done_pages, 0, len(found))
+                    except Exception:  # noqa: BLE001
+                        pass
+                log(f"  {self.name} entry{entry} 第 {page} 页：+{fresh}")
+                max_page = int(r.get("maxPage") or 0)
+                if not comics or not fp:
+                    break  # 空页 = 到头了
+                if fresh == 0:
+                    stale += 1
+                    if stale >= 2:  # 连续 2 页全是旧内容 = 翻页失效
+                        log(f"  {self.name} entry{entry} 连续 2 页无新内容，停止")
+                        break
+                else:
+                    stale = 0
+                if max_page > 0 and page >= max_page:
+                    break
+        return list(found.values())
+
+
 def load_sources(text: str, item_type: str = "COMIC") -> list[BaseSource]:
     """解析源文本（文件内容 / 网址响应）为源对象列表。"""
     raw = text.strip()
+    # Venera JS 源（extends ComicSource）：非 JSON，先识别再尝试 json.loads
+    if "extends ComicSource" in raw[:2000]:
+        return [VeneraSource(raw, item_type)]
     root = json.loads(raw)
     sources: list[BaseSource] = []
     if isinstance(root, dict) and isinstance(root.get("api_site"), dict):

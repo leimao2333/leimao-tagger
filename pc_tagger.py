@@ -556,8 +556,8 @@ def load_backup_file(path, log=print) -> tuple[list[dict], list[tuple[str, str]]
 
     返回 `(items, source_specs)`：
     - `items`：从阅读进度（含封面）抢救出的已读条目，可直接参与视觉打标；
-    - `source_specs`：`(item_type, rawContent)` 列表 —— legado / MoonTV 源的原始内容，
-      交给 source_engine 遍历；venera（JS 引擎）源跳过并记录。
+    - `source_specs`：`(item_type, rawContent)` 列表 —— legado / MoonTV / Venera 源的
+      原始内容，交给 source_engine 遍历（Venera 经 node + venera_runner.js 执行）。
 
     不是备份文件时返回 `([], [])`，调用方按普通清单处理。
     """
@@ -593,18 +593,20 @@ def load_backup_file(path, log=print) -> tuple[list[dict], list[tuple[str, str]]
 
     type_map = {"novel": "NOVEL", "comic": "COMIC", "video": "VIDEO"}
     specs: list[tuple[str, str]] = []
-    skipped = 0
+    venera_count = 0
     for s in data["sources"]:
         raw = (s.get("rawContent") or "").strip()
         if not raw:
             continue
         fmt = str(s.get("format") or "").lower()
-        if fmt == "venera" or "ComicSource" in raw[:500]:
-            skipped += 1
-            continue
+        is_venera = fmt == "venera" or "ComicSource" in raw[:500]
+        if is_venera:
+            venera_count += 1  # v1.1.1：Venera 源交给 node runner 遍历，不再跳过
         # App 备份里 type ∈ novel/comic/video，format 才是 legado/moontv/venera
-        specs.append((type_map.get(str(s.get("type") or "novel").lower(), "NOVEL"), raw))
-    log(f"可遍历源：{len(specs)} 个，JS 引擎跳过 {skipped} 个")
+        item_type = "COMIC" if is_venera else type_map.get(
+            str(s.get("type") or "novel").lower(), "NOVEL")
+        specs.append((item_type, raw))
+    log(f"可遍历源：{len(specs)} 个（含 Venera JS 源 {venera_count} 个）")
     return items, specs
 
 
