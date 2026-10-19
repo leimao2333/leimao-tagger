@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""磊毛阅读 · PC 端封面打标工具（原生窗口版，v1.8.1.8）。
+"""磊毛阅读 · PC 端封面打标工具（浏览器界面 + 原生对话框，v1.0.4）。
 
-运行后在本机起一个 HTTP 服务并打开**原生窗口**（pywebview / WebView2；打包环境
-缺 WebView2 时回退浏览器）：遍历清单里**所有源**的作品逐部打标，页面实时显示
-总体进度条、当前源、每源进度表与滚动日志，可中途停止。
+运行后在本机起一个 HTTP 服务并打开**默认浏览器**页面：遍历清单里**所有源**的
+作品逐部打标，页面实时显示总体进度条、当前源、每源进度表与滚动日志，可中途停止。
+文件/目录选择通过 tkinter 调起 **Windows 原生对话框**。
 
-v1.8.1.8：原生窗口 + 文件/目录选择对话框（pywebview js_api）；自动识别 App
-「备份与恢复」文件（进度条目抢救 + 内嵌 legado/MoonTV 源直接遍历）；模型下载
-进度实时打点；vocab.json 内置打包。
+v1.0.4：pywebview 原生窗口在本机 UI 自动化环境下被 AccessibilityObject 递归
+风暴卡死，弃用；改为浏览器界面 + tkinter 原生选择对话框。新增页面看守（页面
+关闭且无任务 15 分钟自动退出）与「退出程序」按钮，不留后台进程。
 
-打包：pyinstaller --onefile --windowed --add-data "vocab.json;." --collect-all webview --name leimao-pc-tagger pc_tagger_gui.py
+打包：pyinstaller --onefile --windowed --add-data "vocab.json;." --name leimao-pc-tagger pc_tagger_gui.py
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ from pathlib import Path
 import pc_tagger as core
 import source_engine
 
-APP_VERSION = "v1.0.3"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.0.4"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -119,13 +120,11 @@ PAGE = """<!doctype html>
 <script>
 let timer=null;
 function pick(id, kind){
-  const api = window.pywebview && window.pywebview.api;
-  if(!api){ alert('当前为浏览器模式，请手动输入路径'); return; }
-  const p = kind==='dir' ? api.pick_dir('选择目录')
-          : kind==='save' ? api.pick_save('tag_table.json')
-          : api.pick_file('选择文件');
-  p.then(path=>{ if(path) document.getElementById(id).value = path; })
-   .catch(e=>alert('选择失败：'+e));
+  // 经由本机服务调起 Windows 原生文件/目录对话框（tkinter），浏览器里也能用
+  fetch('/api/pick',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind:kind, title:'选择', def:v(id)})})
+    .then(r=>r.json()).then(j=>{ if(j.path) document.getElementById(id).value=j.path; })
+    .catch(e=>alert('选择失败：'+e));
 }
 function start(){
   fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -428,8 +427,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path in ("/", "/index.html"):
+            _LAST_POLL["t"] = time.time()
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path == "/api/status":
+            _LAST_POLL["t"] = time.time()
             self._send(200, json.dumps(STATE.snapshot(), ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
         else:
@@ -472,6 +473,20 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/stop":
             STATE.stop_event.set()
             self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
+        elif self.path == "/api/pick":
+            # 调起 Windows 原生文件/目录对话框（tkinter），替代已废弃的 pywebview js_api
+            try:
+                req = json.loads(body or b"{}")
+                path = DIALOGS.ask(
+                    str(req.get("kind") or "file"),
+                    str(req.get("title") or "选择"),
+                    str(req.get("def") or ""),
+                )
+                payload = {"ok": True, "path": path}
+            except Exception as exc:  # noqa: BLE001
+                payload = {"ok": False, "path": "", "error": str(exc)}
+            self._send(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
         elif self.path == "/api/quit":
             self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
             os._exit(0)  # 无论哪种模式（原生窗口/浏览器回退）都立即彻底退出
@@ -495,58 +510,94 @@ def main() -> None:
     except Exception:  # noqa: BLE001
         pass  # 连不上 = 没有实例，继续正常启动
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    # 关键：后台线程里启动 HTTP 服务（此前原生窗口分支漏掉 serve_forever，导致白屏）
+    # HTTP 服务跑在后台线程（v1.0.3：漏掉 serve_forever 会导致白屏）
     threading.Thread(target=server.serve_forever, daemon=True, name="http-server").start()
-    print(f"磊毛阅读 PC 打标工具已启动：{url} （关闭窗口即退出）")
-    # 优先原生窗口（pywebview / WebView2），打包环境没有就回退浏览器
+    # 页面看守：浏览器页面关闭且无任务运行超过 15 分钟 → 自动退出，不留后台进程
+    threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
+    print(f"磊毛阅读 PC 打标工具已启动：{url} （在浏览器页面点「退出程序」即退出）")
+    # v1.0.4：pywebview 原生窗口在本机 UI 自动化环境下会被卡死（AccessibilityObject
+    # 递归风暴），改用默认浏览器显示界面；文件/目录选择用 tkinter 原生对话框，体验不变。
+    DIALOGS.start()
+    webbrowser.open(url)
     try:
-        import webview  # noqa: PLC0415
-    except Exception:  # noqa: BLE001
-        webbrowser.open(url)
-        try:
-            threading.Event().wait()  # HTTP 服务已在后台线程运行，挂住主线程即可
-        except KeyboardInterrupt:
-            pass
-        os._exit(0)
-    api = PickerApi()
-    window = webview.create_window(
-        f"磊毛阅读 · PC 端封面打标 {APP_VERSION}", url, js_api=api,
-        width=1150, height=940, min_size=(880, 680),
-    )
-    api.bind(window)
-    webview.start()  # 阻塞直到窗口关闭
-    # 窗口已关闭：停掉服务并强制退出，绝不留后台进程
-    server.shutdown()
+        threading.Event().wait()  # 挂住主线程；退出由「退出程序」/看守线程触发
+    except KeyboardInterrupt:
+        pass
     os._exit(0)
 
 
-class PickerApi:
-    """暴露给页面 JS（`pywebview.api.*`）的文件 / 目录选择能力（原生对话框）。"""
+class DialogService:
+    """tkinter 原生文件/目录对话框服务（专用线程 + 事件循环）。
+
+    浏览器页面点「浏览…」→ /api/pick → ask() 投递请求并等待 → 对话框线程弹出
+    真正的 Windows 选择窗口 → 返回所选路径。
+    """
 
     def __init__(self) -> None:
-        import webview  # noqa: PLC0415
+        self.q: "queue.Queue[tuple]" = queue.Queue()
+        self.ready = threading.Event()
 
-        self._webview = webview
-        self.window = None
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True, name="tk-dialogs").start()
+        self.ready.wait(10)
 
-    def bind(self, window) -> None:
-        self.window = window
+    def _run(self) -> None:
+        try:
+            import tkinter as tk  # noqa: PLC0415
+            from tkinter import filedialog  # noqa: PLC0415
+        except Exception:  # noqa: BLE001  没有.tk（罕见）：浏览按钮退化为手动输入
+            self.ready.set()
+            return
+        root = tk.Tk()
+        root.withdraw()  # 只用对话框，不显示主窗口
 
-    def pick_file(self, title: str = "选择文件") -> str:
-        result = self.window.create_file_dialog(
-            self._webview.OPEN_DIALOG, allow_multiple=False, title=title,
-        )
-        return str(result[0]) if result else ""
+        def poll() -> None:
+            try:
+                kind, title, default, box = self.q.get_nowait()
+            except queue.Empty:
+                root.after(120, poll)
+                return
+            try:
+                root.attributes("-topmost", True)
+                if kind == "dir":
+                    r = filedialog.askdirectory(title=title, parent=root)
+                elif kind == "save":
+                    r = filedialog.asksaveasfilename(
+                        title=title, initialfile=default or "tag_table.json", parent=root)
+                else:
+                    r = filedialog.askopenfilename(title=title, parent=root)
+                root.attributes("-topmost", False)
+            except Exception:  # noqa: BLE001
+                r = ""
+            box["v"] = r
+            box["done"].set()
+            root.after(120, poll)
 
-    def pick_dir(self, title: str = "选择目录") -> str:
-        result = self.window.create_file_dialog(self._webview.FOLDER_DIALOG, title=title)
-        return str(result[0]) if result else ""
+        root.after(120, poll)
+        self.ready.set()
+        root.mainloop()
 
-    def pick_save(self, default_name: str = "tag_table.json") -> str:
-        result = self.window.create_file_dialog(
-            self._webview.SAVE_DIALOG, save_filename=default_name,
-        )
-        return str(result) if result else ""
+    def ask(self, kind: str, title: str, default: str = "") -> str:
+        """阻塞直到用户在原生对话框里做出选择（HTTP 线程调用）。"""
+        if not self.ready.is_set():
+            return ""
+        box: dict = {"done": threading.Event(), "v": ""}
+        self.q.put((kind, title, default, box))
+        box["done"].wait(600)  # 对话框最多等 10 分钟
+        return box["v"]
+
+
+DIALOGS = DialogService()
+
+_LAST_POLL = {"t": time.time()}
+
+
+def _watchdog() -> None:
+    """浏览器页面关闭（不再有 /api/status 轮询）且无任务运行 15 分钟 → 退出。"""
+    while True:
+        time.sleep(60)
+        if not STATE.running and time.time() - _LAST_POLL["t"] > 900:
+            os._exit(0)
 
 
 if __name__ == "__main__":
