@@ -294,17 +294,24 @@ class LegadoSource(BaseSource):
             "author": self.rule_explore.get("author") or "",
             "detailUrl": self.rule_explore.get("bookUrl") or "",
         }
-        total_pages = sum(
+        unlimited = pages <= 0  # 0/负数 = 抓全部页，直到某页没有内容
+        total_pages = 0 if unlimited else sum(
             (pages if "{{" in tpl else 1) for _, tpl in self.categories
         )
         done_pages = 0
         found: dict[str, TraversedItem] = {}
         for title, cat_tpl in self.categories:
             has_page = "{{" in cat_tpl
-            for page in range(1, (pages if has_page else 1) + 1):
-                url = render_url(cat_tpl, page)
-                if not url:
+            page = 0
+            prev_url = None
+            while True:
+                page += 1
+                if has_page and not unlimited and page > pages:
                     break
+                url = render_url(cat_tpl, page)
+                if not url or url == prev_url:  # URL 不再变化 = 无分页参数，防止死循环
+                    break
+                prev_url = url
                 url = abs_url(self.base, url)
                 try:
                     body = fetch_text(url, headers=self.search_headers)
@@ -330,11 +337,11 @@ class LegadoSource(BaseSource):
                 done_pages += 1
                 if progress:
                     try:
-                        progress(done_pages, max(total_pages, 1), len(found))
+                        progress(done_pages, total_pages, len(found))
                     except Exception:  # noqa: BLE001
                         pass
                 log(f"  {self.name}「{title}」第 {page} 页：+{fresh}")
-                if page > 1 and not rows:
+                if not rows:
                     break
         return list(found.values())
 
@@ -386,13 +393,20 @@ class AppJsonSource(BaseSource):
             log(f"  跳过：search.list 为 @js 规则（{self.name}）")
             return []
         found: dict[str, TraversedItem] = {}
+        unlimited = pages <= 0
         has_page = "{{" in self.url_tpl
-        total_pages = pages if has_page else 1
+        total_pages = 0 if unlimited else (pages if has_page else 1)
         done_pages = 0
-        for page in range(1, total_pages + 1):
-            url = render_url(self.url_tpl, page)
-            if not url:
+        page = 0
+        prev_url = None
+        while True:
+            page += 1
+            if has_page and not unlimited and page > pages:
                 break
+            url = render_url(self.url_tpl, page)
+            if not url or url == prev_url:
+                break
+            prev_url = url
             url = abs_url(self.base, url)
             try:
                 body = fetch_text(url, headers=self.headers)
@@ -439,7 +453,12 @@ class MacCmsSource(BaseSource):
 
     def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
         found: dict[str, TraversedItem] = {}
-        for page in range(1, pages + 1):
+        unlimited = pages <= 0
+        page = 0
+        while True:
+            page += 1
+            if not unlimited and page > pages:
+                break
             url = f"{self.api}?ac=videolist&pg={page}"
             try:
                 data = fetch_json(url)
@@ -463,13 +482,21 @@ class MacCmsSource(BaseSource):
                     title=t, cover=pic, sourceName=self.name,
                 )
                 fresh += 1
+            # MacCMS 能从响应里拿到总页数，进度条可用
+            pagecount = 0
+            if isinstance(data.get("page"), dict):
+                try:
+                    pagecount = int(data["page"].get("pagecount") or 0)
+                except Exception:  # noqa: BLE001
+                    pagecount = 0
+            total_pages = pagecount if unlimited else pages
             if progress:
                 try:
-                    progress(page, pages, len(found))
+                    progress(page, total_pages, len(found))
                 except Exception:  # noqa: BLE001
                     pass
             log(f"  {self.name} 第 {page} 页：+{fresh}")
-            if page >= int(data.get("page", {}).get("pagecount", 1) if isinstance(data.get("page"), dict) else 1):
+            if unlimited and pagecount and page >= pagecount:
                 break
             if not rows:
                 break

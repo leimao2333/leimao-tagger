@@ -28,7 +28,7 @@ import pc_tagger as core
 import source_engine
 import win_dialogs
 
-APP_VERSION = "v1.0.6"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.0.7"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -77,9 +77,9 @@ PAGE = """<!doctype html>
  <div class="row">网络清单：<input type="text" id="cloud" style="width:480px" placeholder="https://cdn.jsdelivr.net/gh/leimao2333/leimao-tagger@main/data/tag_table.json"> <span class="muted">拉云端表作为基底；两个都填则合并，留空本地则必填</span></div>
  <div class="row">书源导入：<input type="text" id="sources" style="width:420px" placeholder="shuyuan.json / MoonTV 配置 / https://…，多个用 | 分隔"> <button onclick="pick('sources','file')">浏览…</button></div>
  <div class="row">
-   遍历页数/分类：<input type="text" id="srcPages" value="2" style="width:40px">
+   遍历页数/分类：<input type="text" id="srcPages" value="0" style="width:40px">
    书源内容类型：<select id="srcType"><option value="COMIC">漫画</option><option value="NOVEL">小说</option></select>
-   <span class="muted">MacCMS（视频站）固定按视频收录</span>
+   <span class="muted">0 = 抓全部页直到没有内容；MacCMS（视频站）固定按视频收录</span>
  </div>
  <div class="row">输出文件：<input type="text" id="out" value="__DEFAULT_OUT__"> <button onclick="pick('out','save')">另存为…</button> <span class="muted">打标结果 JSON 的保存位置</span></div>
  <div class="row">
@@ -154,8 +154,10 @@ function render(s){
   document.getElementById('stext').innerHTML='<b>当前源：'+(s.current||'—')+'</b>';
   const src=s.sources||{}; const names=Object.keys(src);
   const tb='<tr><th>源</th><th>页/封面数</th><th>已完成</th><th>进度</th></tr>'+
-    names.map(n=>{const x=src[n];const p=x.total?Math.round(x.done*100/x.total):100;
-      return '<tr><td>'+n+'</td><td>'+x.total+'</td><td>'+x.done+'（'+x.hit+'）</td><td>'+x.done+'/'+x.total+'（'+p+'%）</td></tr>';}).join('');
+    names.map(n=>{const x=src[n];let p,cell;
+      if(x.total>0){p=Math.round(x.done*100/x.total);cell=x.done+'/'+x.total+'（'+p+'%）';}
+      else{p=x.fin?100:35;cell=(x.fin?'完成':'抓取中')+' '+x.done+' 页 / 收录 '+x.hit+' 部';}
+      return '<tr><td>'+n+'</td><td>'+(x.total||'—')+'</td><td>'+x.done+'（'+x.hit+'）</td><td>'+cell+'</td></tr>';}).join('');
   document.getElementById('sources').innerHTML=tb;
   document.getElementById('sbar').style.width=(s.total? s.done*100/s.total:100)+'%';
   const log=document.getElementById('log');
@@ -306,8 +308,10 @@ class TaggingJob(threading.Thread):
                     STATE.done += 1
                     STATE.hit += len(found)
                     row = STATE.sources.setdefault(source.name, {"total": 0, "done": 0, "hit": 0})
-                    row["total"] = max(row["total"], 1)
-                    row["done"] = row["total"]  # 该源完成：进度条拉满
+                    if row["total"] > 0:
+                        row["done"] = row["total"]  # 该源完成：进度条拉满
+                    else:
+                        row["fin"] = 1  # 全部模式：标记完成
                     row["hit"] = len(found)
                 if found:
                     items = core.merge_items(items, found)
@@ -455,6 +459,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")  # 禁止浏览器缓存页面/接口
         self.end_headers()
         self.wfile.write(body)
 
