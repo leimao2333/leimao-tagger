@@ -28,7 +28,7 @@ import pc_tagger as core
 import source_engine
 import win_dialogs
 
-APP_VERSION = "v1.0.8"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.0.9"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -223,6 +223,35 @@ class TaggingJob(threading.Thread):
         self.cfg = cfg
 
     def run(self) -> None:
+        try:
+            self._work()
+        except Exception as exc:  # noqa: BLE001  任何未预期异常都落日志并保存已有结果
+            STATE.log(f"任务异常终止：{exc!r}")
+            self._save()
+            STATE.running, STATE.finished = False, True
+
+    def _save(self, note: str = "") -> None:
+        """把当前 items 立即写盘（边跑边存，进程意外退出也有产出）。"""
+        try:
+            items = getattr(self, "_items", None)
+            if items is None:
+                return
+            tagged = sum(
+                1 for it in items
+                if any(t.get("origin") == core.ORIGIN_VISUAL for t in it.get("tags", []))
+            )
+            Path(self.cfg["out"]).write_text(
+                json.dumps({"version": 1, "generatedAt": int(time.time() * 1000),
+                            "source": "pc", "items": items},
+                           ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+            STATE.log(f"已保存{'（' + note + '）' if note else ''}：{self.cfg['out']}"
+                      f"（共 {len(items)} 条，其中视觉打标 {tagged} 部）")
+        except Exception as exc:  # noqa: BLE001
+            STATE.log(f"输出写入失败：{exc}")
+
+    def _work(self) -> None:
         def log(msg: str) -> None:
             STATE.log(msg)
 
@@ -315,13 +344,17 @@ class TaggingJob(threading.Thread):
                     row["hit"] = len(found)
                 if found:
                     items = core.merge_items(items, found)
+                    self._items = items
                     log(f"  {source.name}：收录 {len(found)} 部，合并后共 {len(items)} 条")
+                if STATE.done % 20 == 0:
+                    self._save(f"已遍历 {STATE.done} 个源")  # 遍历阶段也边跑边存
 
         if not items:
             STATE.log("网络清单、本地清单与书源导入至少要提供一个")
             STATE.running, STATE.finished = False, True
             return
         log(f"合并后条目：{len(items)}")
+        self._items = items  # 之后所有阶段随时可落盘
 
         # 标题解析打标（MangaReader 式：作者/汉化组/作品/会场/平台/其他，origin=文本）
         try:
@@ -329,6 +362,7 @@ class TaggingJob(threading.Thread):
             log(f"标题解析命中：{title_hit} 部（作者/汉化组/作品等，置信度 {core.TEXT_CONFIDENCE}）")
         except Exception as exc:  # noqa: BLE001
             log(f"标题解析失败（跳过）：{exc}")
+        self._save("遍历+标题解析完成")  # 边跑边存：此时已含全部收录与标题标签
 
         try:
             vocab = core.Vocab.load(Path(self.cfg["vocab"]))
@@ -420,20 +454,14 @@ class TaggingJob(threading.Thread):
                         STATE.hit += 1
                         item["tags"] = sorted(merged.values(), key=lambda t: -t["confidence"])
                     log(f"  {'✓ ' + title + f'（{hit} 个受控标签）' if hit else '– ' + title + '：无可映射标签'}")
+                if STATE.done % 50 == 0:
+                    self._save(f"已打标 {STATE.done} 部")  # 每 50 部落一次盘
 
         tagged = sum(
             1 for it in items
             if any(t.get("origin") == core.ORIGIN_VISUAL for t in it.get("tags", []))
         )
-        try:
-            Path(self.cfg["out"]).write_text(
-                json.dumps({"version": 1, "generatedAt": int(time.time() * 1000), "source": "pc", "items": items},
-                           ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
-            log(f"输出已写入：{self.cfg['out']}（累计视觉打标 {tagged} 部）")
-        except Exception as exc:  # noqa: BLE001
-            log(f"输出写入失败：{exc}")
+        self._save("任务完成")
 
         if self.cfg["push"] and not stopped:
             try:
