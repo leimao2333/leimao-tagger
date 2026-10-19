@@ -75,12 +75,21 @@ def main() -> None:
 
     # 1) 紧凑化（App 侧解析不受影响）
     compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    latest_path = os.path.join(DATA, "tag_table.json")
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # 固定名：给旧版 App（只认 data/tag_table.json）用；缺点是被 jsDelivr 缓存住，
+    # 覆盖后最长要等 7 天或手动 purge 才生效，所以**新 App 不走这个地址**。
+    with open(os.path.join(DATA, "tag_table.json"), "wb") as f:
+        f.write(compact)
+
+    # 带时间戳的名字：每次发布都是新 URL，jsDelivr 没有旧缓存可命中，立刻可用。
+    # manifest.latest 指向它 —— 这就是「更新后 App 马上能拉到」的关键。
+    latest_name = f"tag_table-{stamp}.json"
+    latest_path = os.path.join(DATA, latest_name)
     with open(latest_path, "wb") as f:
         f.write(compact)
 
     # 2) 归档
-    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     arc_name = f"tag_table-{stamp}.json.gz"
     arc_path = os.path.join(ARCHIVE, arc_name)
     with gzip.open(arc_path, "wb", compresslevel=9) as f:
@@ -95,20 +104,30 @@ def main() -> None:
     kept = archives[: args.keep]
     for old in archives[args.keep:]:
         os.remove(os.path.join(ARCHIVE, old))
+
+    # 带时间戳的最新表只保留最近 2 份（当前 + 上一份），否则仓库每次多 11MB
+    versioned = sorted(
+        (n for n in os.listdir(DATA) if n.startswith("tag_table-") and n.endswith(".json")),
+        reverse=True,
+    )
+    for old in versioned[2:]:
+        os.remove(os.path.join(DATA, old))
+
     manifest = {
-        "latest": "tag_table.json",
+        "latest": latest_name,
         "generatedAt": payload.get("generatedAt"),
         "updatedAt": int(_dt.datetime.now().timestamp() * 1000),
         "bytes": len(compact),
         "sha256": hashlib.sha256(compact).hexdigest(),
         "archive": [f"archive/{n}" for n in kept],
         **stats,
-        "note": "App 设置 → 标签 → 标签导入 → 云端，先读本文件判断版本，再决定是否下载 tag_table.json",
+        "note": "latest 用带时间戳的文件名：jsDelivr 按 URL 缓存最长 7 天，覆盖同名文件会一直拿到旧内容；新文件名即新缓存键",
     }
     with open(os.path.join(DATA, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
-    print(f"[ok] 写入 {os.path.relpath(latest_path, ROOT)}  {len(compact):,} 字节")
+    print(f"[ok] 写入 {os.path.relpath(latest_path, ROOT)}  {len(compact):,} 字节（manifest.latest）")
+    print(f"[ok] 同步覆盖 data/tag_table.json（旧版 App 兼容地址）")
     print(f"[ok] 归档 {os.path.relpath(arc_path, ROOT)}  {os.path.getsize(arc_path):,} 字节")
     print(f"[ok] 条目 {stats['count']:,}（有标签 {stats['taggedCount']:,}）  类型 {stats['types']}  源 {stats['sources']} 个")
     print(f"[ok] manifest 已更新，归档共 {len(kept)} 份")

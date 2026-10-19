@@ -1,5 +1,5 @@
 {
-  "latest": "tag_table.json",
+  "latest": "tag_table-20261019-2204.json",
   "generatedAt": 1792416477320,
   "updatedAt": 1792418669196,
   "count": 20295,
@@ -15,5 +15,5 @@
   "archive": [
     "archive/tag_table-20261019-220428.json.gz"
   ],
-  "note": "App 设置 → 标签 → 标签导入 → 云端，先读本文件判断版本，再决定是否下载 tag_table.json"
+  "note": "latest 用带时间戳的文件名：jsDelivr 按 URL 缓存最长 7 天，覆盖同名文件会一直拿到旧内容；新文件名即新缓存键"
 }
