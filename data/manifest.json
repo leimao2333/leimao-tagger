@@ -1,19 +1,20 @@
 {
-  "latest": "tag_table-20261019-2204.json",
-  "generatedAt": 1792416477320,
-  "updatedAt": 1792418669196,
-  "count": 20295,
-  "taggedCount": 17563,
-  "bytes": 10997930,
-  "sha256": "1cae24d1a8b8bb781fc770f2262b55e63d97408c22a4d060d0b4dcc777e44bdc",
-  "types": {
-    "NOVEL": 16691,
-    "COMIC": 782,
-    "VIDEO": 2822
-  },
-  "sources": 148,
+  "latest": "tag_table-20261021-122955.json",
+  "generatedAt": 1792556456012,
+  "updatedAt": 1792556997454,
+  "bytes": 80154931,
+  "sha256": "487882bf19cbb3dc19d9a9f7a81ffc91f765dbc2d532850fb92676ddeb46f2f2",
   "archive": [
+    "archive/tag_table-20261021-122955.json.gz",
     "archive/tag_table-20261019-220428.json.gz"
   ],
+  "count": 129001,
+  "taggedCount": 126431,
+  "types": {
+    "NOVEL": 19888,
+    "COMIC": 2811,
+    "VIDEO": 106302
+  },
+  "sources": 195,
   "note": "latest 用带时间戳的文件名：jsDelivr 按 URL 缓存最长 7 天，覆盖同名文件会一直拿到旧内容；新文件名即新缓存键"
 }
