@@ -32,6 +32,9 @@ from urllib.parse import urlparse
 
 import requests
 
+import source_engine
+import tag_search
+
 MODEL_URL = "https://hf-mirror.com/SmilingWolf/wd-v1-4-vit-tagger-v2/resolve/main/model.onnx"
 TAGS_URL = "https://hf-mirror.com/SmilingWolf/wd-v1-4-vit-tagger-v2/resolve/main/selected_tags.csv"
 INPUT_SIZE = 448
@@ -297,8 +300,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"合并后条目：{len(items)}")
 
     # 网络源遍历（书源文件/网址 → 逐源抓 标题+封面）
+    loaded_sources: dict[str, object] = {}
     if args.sources:
-        import source_engine
         for spec in [s.strip() for s in args.sources.split("|") if s.strip()]:
             try:
                 sources = source_engine.load_sources_from_text_or_url(spec, args.src_type, print)
@@ -307,6 +310,7 @@ def run(args: argparse.Namespace) -> int:
                 continue
             print(f"书源装载成功：{len(sources)} 个源")
             for source in sources:
+                loaded_sources[getattr(source, "source_id", "") or source.name] = source
                 try:
                     found = source.explore(args.src_pages, print)
                 except Exception as exc:  # noqa: BLE001
@@ -315,6 +319,37 @@ def run(args: argparse.Namespace) -> int:
                 if found:
                     items = merge_items(items, found)
                     print(f"  {source.name}：收录 {len(found)} 部")
+
+    # 标签搜索遍历（v1.8.7.2 待办 #25）：按受控词表逐标签搜源站，补齐分类遍历漏掉的内容
+    if args.tag_search:
+        if not loaded_sources:
+            print("--tag-search 需要 --sources 提供可搜索的书源")
+            return 2
+        searchable = [
+            s for s in loaded_sources.values()
+            if getattr(s, "can_search", lambda: False)() and getattr(s, "search", None)
+        ]
+        print(f"可搜索源：{len(searchable)}/{len(loaded_sources)}")
+        groups = tag_search.load_groups(args.vocab)
+        plans = tag_search.build_plans(
+            groups,
+            searchable,
+            only_tags=[t for t in (args.tags or "").split(",") if t.strip()] or None,
+            tag_limit=args.tag_limit,
+            sources_per_tag=args.tag_sources,
+            terms_per_tag=args.tag_terms,
+        )
+        print(f"标签搜索计划：{len(plans)} 个标签"
+              f"（写法 ≤{args.tag_terms} / 源 ≤{args.tag_sources} / 页 ≤{args.tag_pages}）")
+        for plan in plans:
+            print(f"  · {plan.describe()}")
+        found_items, stats = tag_search.run_tag_search(
+            plans, loaded_sources, args.tag_pages, print,
+        )
+        print(f"标签搜索汇总：{stats}")
+        if found_items:
+            items = merge_items(items, found_items)
+            print(f"标签搜索新收录：{len(found_items)} 部，合并后条目 {len(items)}")
 
     # 标题解析打标（MangaReader 式：作者 / 汉化组 / 作品 / 会场 等，origin=文本）
     title_tagged = apply_title_tags(items)
@@ -408,6 +443,8 @@ def _write_out(args: argparse.Namespace, items: list[dict]) -> int:
 CLOUD_TABLE_URL = (
     "https://cdn.jsdelivr.net/gh/leimao2333/leimao-tagger@main/data/tag_table.json"
 )
+# main() 的 argparse 在文件末尾，两个名字都指向同一个云端表地址
+DEFAULT_CLOUD_TABLE_URL = CLOUD_TABLE_URL
 ORIGIN_TEXT = "文本"
 TEXT_CONFIDENCE = 60
 
@@ -540,10 +577,10 @@ def merge_items(base: list[dict], extra: list[dict]) -> list[dict]:
             item["tags"] = {t.get("name", ""): dict(t) for t in item.get("tags", [])}
             by_key[key] = item
             continue
-        for name, tag in item.get("tags", []):
-            existing["tags"][tag.get("name") or name] = merge_entry(
-                existing["tags"].get(tag.get("name") or name), dict(tag),
-            )
+        for tag in item.get("tags", []):
+            tag = dict(tag)
+            name = tag.get("name") or ""
+            existing["tags"][name] = merge_entry(existing["tags"].get(name), tag)
     out = []
     for item in by_key.values():
         item["tags"] = sorted(item["tags"].values(), key=lambda t: -t.get("confidence", 0))
@@ -671,6 +708,21 @@ def main() -> None:
     parser.add_argument("--sources", default=None, help="书源文件/网址（legado shuyuan / App JSON 源 / MoonTV 配置，多个用 | 分隔）：PC 直接遍历抓 标题+封面")
     parser.add_argument("--src-pages", type=int, default=2, help="书源遍历每分类抓几页（默认 2）")
     parser.add_argument("--src-type", default="COMIC", choices=["COMIC", "NOVEL"], help="书源条目内容类型（MacCMS 固定 VIDEO）")
+
+    # ===== 标签搜索遍历（v1.8.7.2 待办 #25）=====
+    parser.add_argument("--tag-search", action="store_true",
+                        help="在书源遍历之外，按受控词表的标签逐个搜索源站，补充收录（需 --sources）")
+    parser.add_argument("--tags", default=None,
+                        help="只跑这些标签（逗号分隔，如 无码,全彩,悬疑）；缺省按词表顺序跑前 --tag-limit 个")
+    parser.add_argument("--tag-limit", type=int, default=tag_search.DEFAULT_TAG_LIMIT,
+                        help=f"本轮最多跑多少个标签（默认 {tag_search.DEFAULT_TAG_LIMIT}，0 = 不限）")
+    parser.add_argument("--tag-sources", type=int, default=tag_search.DEFAULT_SOURCES_PER_TAG,
+                        help=f"每个标签最多分配几个源（默认 {tag_search.DEFAULT_SOURCES_PER_TAG}，全源轮转；0 = 全部）")
+    parser.add_argument("--tag-terms", type=int, default=tag_search.DEFAULT_TERMS_PER_TAG,
+                        help=f"每个标签展开几个同义写法（默认 {tag_search.DEFAULT_TERMS_PER_TAG}，对齐 App）")
+    parser.add_argument("--tag-pages", type=int, default=tag_search.DEFAULT_PAGES_PER_TERM,
+                        help=f"每个写法抓几页（默认 {tag_search.DEFAULT_PAGES_PER_TERM}，0 = 抓到空页为止）")
+
     parser.add_argument("--out", default="tag_table.json", help="输出路径（默认 ./tag_table.json）")
     parser.add_argument("--vocab", default=str(Path(__file__).resolve().parent / "vocab.json"), help="受控词表")
     parser.add_argument("--model-dir", default="models/wd14", help="模型缓存目录")

@@ -18,6 +18,10 @@ App 端「设置 → 标签 → 标签导入」（默认 jsDelivr 指向本仓�
   （JSONPath 子集 + `selector@attr` / `class.x` / `tag.x` 链式选择 + `{{page}}` 渲染）。
 - **App 备份直读**：收录清单处可直接选 App「备份与恢复」导出的 JSON —— 自动识别，
   从阅读进度抢救条目（含封面），并把备份里的 legado / MoonTV 源取出来直接遍历。
+- **标签搜索遍历**（v1.1.2）：分类遍历只能覆盖站方恰好建了分类页的内容；勾选后按
+  受控词表的标签逐个搜索源站（同义写法展开与 App 侧 `TagAlias.searchTermsForQuery`
+  同一口径，全源轮转分配），把搜索结果汇入清单一起打标。搜索结果**只用来发现条目**，
+  不把搜索词写成标签 —— 关键词命中 ≠ 作品属于该标签（与 App「打标证据化」同口径）。
 - **网络清单**：拉取 GitHub 云端打标表作为基底，与本地清单 / 书源遍历结果合并。
 - **标题解析打标**：参考 [kawayiYokami/MangaReader](https://github.com/kawayiYokami/MangaReader)
   的 `metadata_parser`，从书名解析 `作者 / 汉化组 / 作品 / 会场 / 平台 / 其他`
@@ -32,7 +36,8 @@ App 端「设置 → 标签 → 标签导入」（默认 jsDelivr 指向本仓�
 |---|---|
 | `pc_tagger.py` | 核心逻辑 + CLI（Python 3.10+） |
 | `pc_tagger_gui.py` | **窗口版**：原生窗口 + 文件/目录选择，实时进度 / 各源进度表 / 日志，可中途停止 |
-| `source_engine.py` | 网络源遍历引擎：legado 书源 / App JSON 源 / MacCMS 采集站的精简规则引擎 |
+| `source_engine.py` | 网络源遍历引擎：legado 书源 / App JSON 源 / MacCMS 采集站的精简规则引擎（含 `search()` 关键词搜索） |
+| `tag_search.py` | 标签搜索遍历管道：词表分组 → 同义写法挑选 → 全源轮转分配 → 逐标签搜索（v1.1.2 新增） |
 | `gen_vocab.py` | 从 App 源码 `TagAlias.kt` 生成受控词表 `vocab.json`（词表改动后重跑） |
 | `vocab.json` | 受控词表（danbooru/english → 中文规范名），PC 端映射口径 |
 | `data/tag_table.json` | 云端打标表（App「标签导入」的默认地址） |
@@ -78,8 +83,9 @@ python publish_tags.py --purge
 优先，可自定义映射口径）。
 
 1. 「书源导入」填书源文件 / 网址（多个用 `|` 分隔），或「收录清单」选 App 备份 / 打标表；
-2. 点「开始遍历打标」；「输出文件」「模型目录」留空即用 exe 同目录默认值；
-3. 勾选「打标后推送 GitHub」可直接更新云端表（Token 可选，留空用环境变量 `GH_TOKEN`）。
+2. 需要按标签补收录时，勾选「标签搜索遍历」，可限定只跑哪些标签、每标签源数 / 写法数 / 页数；
+3. 点「开始遍历打标」；「输出文件」「模型目录」留空即用 exe 同目录默认值；
+4. 勾选「打标后推送 GitHub」可直接更新云端表（Token 可选，留空用环境变量 `GH_TOKEN`）。
 
 ### CLI
 
@@ -92,12 +98,30 @@ python pc_tagger.py --list leimao-backup.json --out tag_table.json
 # 或只用书源文件遍历
 python pc_tagger.py --sources shuyuan.json --src-type COMIC --src-pages 2
 
+# 标签搜索遍历：分类遍历之外，再按词表标签逐个搜源站（需 --sources）
+python pc_tagger.py --sources shuyuan.json --src-pages 2 \
+    --tag-search --tags "无码,科幻,悬疑" --tag-pages 2
+
 # 推送到本仓库（App 端「标签导入」即可拉取）
 python pc_tagger.py --cloud --out tag_table.json --push --token ghp_xxx
 ```
 
 参数：`--cloud [URL]` 网络清单；`--limit N` 本轮最多打标条数；`--workers N` 封面下载并发；
 `--model-dir` 模型缓存目录；`--vocab` 词表路径；`--token` 也可用环境变量 `GH_TOKEN`。
+
+标签搜索遍历参数（`--tag-search` 时生效）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--tags` | 空 | 只跑这些标签（逗号分隔）；留空按词表顺序跑前 `--tag-limit` 个 |
+| `--tag-limit` | 40 | 本轮最多跑多少个标签（0 = 不限） |
+| `--tag-sources` | 8 | 每个标签最多分配几个源（全源轮转；0 = 全部） |
+| `--tag-terms` | 3 | 每个标签展开几个同义写法（对齐 App 的挑选口径） |
+| `--tag-pages` | 2 | 每个写法抓几页（0 = 抓到空页为止） |
+
+可搜索的源：legado 书源需配 `searchUrl` + `ruleSearch.bookList`（`@js` 跳过）；
+App JSON 源需 `search.url` 含 `{{keyword}}`；MacCMS 源固定可用
+（`ac=detail&wd=<关键词>`）。
 
 ## 打包 exe
 

@@ -16,6 +16,17 @@
 （`selector@attr`、`class.x` / `id.x` / `tag.x`，尾部 `.N` 取第 N 个），
 `{{page}}` 与纯算术 `{{(page-1)*20}}` 占位符可渲染；`@js:` 等复杂规则跳过。
 JS 源 / Venera 源无法在 PC 端评估，遍历时记录日志后跳过。
+
+**标签搜索（v1.8.7.2 待办 #25）**：每个源除 `explore()`（按分类遍历）外还有
+`search(keyword, pages, ...)`（按标签同义写法搜索），口径对齐 App 侧
+`TagEntryUrl` / `LegadoBookSource.searchUrl` / `MoonTvSourceAdapter.ac=detail&wd=`：
+- legado：`searchUrl` 模板（`{{key}}` / `{{page}}`）+ `ruleSearch` 字段规则；
+- App JSON：`search.url` 里的 `{{keyword}}` 占位；
+- MacCMS：`?ac=detail&wd=<词>&pg=<页>`；
+- Venera / JS：PC 端评估不了，跳过。
+
+搜索只用来**发现条目**：抓到的作品照常走标题解析 + 视觉打标，不把搜索词本身
+写成标签 —— 与 App 的「打标证据化」口径一致（关键词命中 ≠ 作品属于该标签）。
 """
 
 from __future__ import annotations
@@ -26,7 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import quote, urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -55,15 +66,22 @@ def fetch_json(url: str, timeout: int = TIMEOUT, headers: dict | None = None):
 # ---------------------------------------------------------------- URL 渲染
 
 
-def render_url(template: str, page: int, keyword: str = "") -> str | None:
-    """渲染 URL 模板：{{page}} / {{searchPage}} / 纯算术 {{(page-1)*20}}。
+def render_url(template: str, page: int = 1, keyword: str = "",
+               allow_keyword: bool = False) -> str | None:
+    """渲染 URL 模板：{{page}} / {{searchPage}} / 纯算术 {{(page-1)*20}} / {{keyword}}。
 
-    其余 {{表达式}}（需要 JS 求值）渲染失败时按空串丢弃；含 {{keyword}} 的
-    模板在遍历场景没有意义，返回 None 让调用方跳过。
+    其余 {{表达式}}（需要 JS 求值）渲染失败时按空串丢弃。
+
+    @param allow_keyword 是否渲染 {{keyword}} / {{key}} 占位。遍历（explore）场景
+      没有关键词，传 False 时遇到这两种占位一律返回 None（老行为）；标签搜索
+      （search）场景传 True，并把关键词做 URL 编码。
     """
-    if "{{keyword}}" in template or "{{key}}" in template:
+    if ("{{keyword}}" in template or "{{key}}" in template) and not allow_keyword:
         return None
-    out = template.replace("{{searchPage}}", str(page)).replace("{{page}}", str(page))
+    out = (template
+           .replace("{{keyword}}", quote(keyword, safe=""))
+           .replace("{{key}}", quote(keyword, safe="")))
+    out = out.replace("{{searchPage}}", str(page)).replace("{{page}}", str(page))
 
     def _eval(m: re.Match) -> str:
         expr = m.group(1).replace("page", str(page)).replace("searchPage", str(page))
@@ -75,6 +93,11 @@ def render_url(template: str, page: int, keyword: str = "") -> str | None:
             return ""
 
     return re.sub(r"\{\{([^{}]+)\}\}", _eval, out)
+
+
+def normalize_term(term: str) -> str:
+    """同义写法归一到源站查询词（App 侧 [TagAlias.norm] 的同一口径：去空白 + 小写）。"""
+    return "".join(term.split()).lower()
 
 
 # ---------------------------------------------------------------- 规则求值
@@ -262,6 +285,71 @@ class BaseSource:
         """遍历源；progress(done_pages, total_pages, items_found) 每页回调一次（UI 进度）。"""
         raise NotImplementedError
 
+    def search(self, keyword: str, pages: int, log, progress=None) -> list[TraversedItem]:
+        """按标签关键词搜索源（v1.8.7.2 待办 #25）。
+
+        与 [explore] 的产物结构完全一致，因此调用方可以把搜索结果直接并入遍历结果，
+        一起走标题解析 + 视觉打标。**不把 keyword 本身写成标签** —— 关键词命中
+        不等于作品属于该标签（App 侧「打标证据化」的同一口径）。
+
+        @param keyword 已经过同义组归一的一个写法（见 tag_search.py）
+        @param pages   最多抓几页；<=0 = 抓到没有内容为止
+        """
+        return []
+
+    # 源是否支持关键词搜索（标签搜索管道据此跳过并计数）
+    def can_search(self) -> bool:
+        return False
+
+
+def _drain_pages(fetch_rows, pages: int, log, progress, make_item, tag: str):
+    """翻页抓取的公共骨架：累加到 max_pages / 遇到空页 / 连续 3 页无新内容即停。
+
+    @param fetch_rows(page) 抓一页并返回原始 rows（抓不到时返回 None 即停）
+    @param make_item(row)   原始行 → [TraversedItem]（无标题/封面的行返回 None）
+    """
+    found: dict[str, TraversedItem] = {}
+    unlimited = pages <= 0
+    stale = 0
+    for page in range(1, pages + 1) if not unlimited else _count_from_one():
+        rows = fetch_rows(page)
+        if rows is None:
+            break
+        fresh = 0
+        for row in rows:
+            item = make_item(row)
+            if not item:
+                continue
+            key = item.get("itemId") or item.get("title")
+            if key in found:
+                continue
+            found[key] = item
+            fresh += 1
+        if progress:
+            try:
+                progress(page, len(found))
+            except Exception:  # noqa: BLE001
+                pass
+        log(f"  「{tag}」第 {page} 页：+{fresh}")
+        if not rows:
+            break
+        if fresh == 0:
+            stale += 1
+            if stale >= 3:  # 连续 3 页无新内容 = 站点翻页重复，跳过该源
+                log(f"  「{tag}」连续 3 页无新内容，停止翻页")
+                break
+        else:
+            stale = 0
+    return list(found.values())
+
+
+def _count_from_one():
+    """无限翻页的页号生成器（1, 2, 3, …）。"""
+    n = 0
+    while True:
+        n += 1
+        yield n
+
 
 class LegadoSource(BaseSource):
     """legado / shuyuan 书源：exploreUrl + ruleExplore。"""
@@ -284,6 +372,63 @@ class LegadoSource(BaseSource):
             except Exception:  # noqa: BLE001
                 h = {}
         self.search_headers = h if isinstance(h, dict) else {}
+        # 标签搜索（v1.8.7.2 #25）：searchUrl 模板 + ruleSearch 字段规则
+        self.search_url_tpl = (obj.get("searchUrl") or "").strip()
+        rule_search = obj.get("ruleSearch") or {}
+        self.rule_search = rule_search if isinstance(rule_search, dict) else {}
+
+    def can_search(self) -> bool:
+        return bool(self.search_url_tpl and self.rule_search.get("bookList"))
+
+    def search(self, keyword: str, pages: int, log, progress=None) -> list[TraversedItem]:
+        if not self.can_search():
+            log(f"  跳过：searchUrl / ruleSearch.bookList 缺失（{self.name}）")
+            return []
+        if self.search_url_tpl.startswith(("@js", "<js")):
+            log(f"  跳过：searchUrl 含 @js，PC 端不支持（{self.name}）")
+            return []
+        fields = {
+            "title": self.rule_search.get("name") or "",
+            "cover": self.rule_search.get("coverUrl") or "",
+            "author": self.rule_search.get("author") or "",
+            "detailUrl": self.rule_search.get("bookUrl") or "",
+        }
+        state = {"url": ""}
+
+        def fetch_rows(page):
+            url = render_url(self.search_url_tpl, page, keyword, allow_keyword=True)
+            if not url:
+                return None
+            url = abs_url(self.base, url)
+            if url == state["url"]:  # URL 不再变化 = 无分页参数，防止死循环
+                return None
+            state["url"] = url
+            try:
+                body = fetch_text(url, headers=self.search_headers)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  ✗ {self.name} 搜索「{keyword}」第 {page} 页：{exc}")
+                return None
+            # 搜索结果的元信息没有意义，只取标题 / 封面 / 详情地址
+            return extract_list(
+                body, self.rule_search.get("bookList", ""),
+                {k: v for k, v in fields.items() if k != "author"}, url,
+            )
+
+        def make_item(row) -> TraversedItem | None:
+            title = (row.get("title") or "").strip()
+            cover = abs_url(state["url"], row.get("cover") or "")
+            detail = abs_url(state["url"], row.get("detailUrl") or "")
+            if not title or not cover:
+                return None
+            return TraversedItem(
+                sourceId=self.source_id, itemId=detail or title, itemType=self.item_type,
+                title=title, cover=cover, sourceName=self.name,
+            )
+
+        return _drain_pages(
+            fetch_rows, pages, log, progress, make_item,
+            tag=f"{self.name}·搜索「{keyword}」",
+        )
 
     def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
         if not self.categories:
@@ -394,6 +539,48 @@ class AppJsonSource(BaseSource):
         self.fields = search.get("fields") or {}
         self.headers = search.get("headers") or {}
 
+    def can_search(self) -> bool:
+        if not self.url_tpl or self.list_rule.startswith("@js"):
+            return False
+        return "{{keyword}}" in self.url_tpl or "{{key}}" in self.url_tpl
+
+    def search(self, keyword: str, pages: int, log, progress=None) -> list[TraversedItem]:
+        if not self.can_search():
+            log(f"  跳过：search.url 不含 {{keyword}} 或 list 为 @js（{self.name}）")
+            return []
+        state = {"url": ""}
+
+        def fetch_rows(page):
+            url = render_url(self.url_tpl, page, keyword, allow_keyword=True)
+            if not url:
+                return None
+            url = abs_url(self.base, url)
+            if url == state["url"]:
+                return None
+            state["url"] = url
+            try:
+                body = fetch_text(url, headers=self.headers)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  ✗ {self.name} 搜索「{keyword}」第 {page} 页：{exc}")
+                return None
+            return extract_list(body, self.list_rule, self.fields, url)
+
+        def make_item(row) -> TraversedItem | None:
+            title = (row.get("title") or row.get("name") or "").strip()
+            cover = abs_url(state["url"], row.get("cover") or row.get("image") or "")
+            detail = abs_url(self.base, row.get("id") or row.get("url") or "")
+            if not title or not cover:
+                return None
+            return TraversedItem(
+                sourceId=self.source_id, itemId=detail or title, itemType=self.item_type,
+                title=title, cover=cover, sourceName=self.name,
+            )
+
+        return _drain_pages(
+            fetch_rows, pages, log, progress, make_item,
+            tag=f"{self.name}·搜索「{keyword}」",
+        )
+
     def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
         if not self.url_tpl:
             log(f"  跳过：search.url 缺失（{self.name}）")
@@ -470,6 +657,38 @@ class MacCmsSource(BaseSource):
         self.api = api.rstrip("?")
         self.detail = detail.rstrip("/")
         self.item_type = "VIDEO"
+
+    def can_search(self) -> bool:
+        return True
+
+    def search(self, keyword: str, pages: int, log, progress=None) -> list[TraversedItem]:
+        """按 `ac=detail&wd=<词>&pg=<页>` 搜索（与 App 的 [MoonTvSourceAdapter] 同一口径）。"""
+
+        def fetch_rows(page):
+            url = f"{self.api}?ac=detail&wd={quote(keyword, safe='')}&pg={page}"
+            try:
+                data = fetch_json(url)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  ✗ {self.name} 搜索「{keyword}」第 {page} 页：{exc}")
+                return None
+            return data.get("list") or []
+
+        def make_item(row) -> TraversedItem | None:
+            title = (row.get("vod_name") or "").strip()
+            cover = (row.get("vod_pic") or "").strip()
+            if not title or not cover:
+                return None
+            video_id = str(row.get("vod_id") or title)
+            detail = f"{self.detail}?p={video_id}" if self.detail else video_id
+            return TraversedItem(
+                sourceId=self.source_id, itemId=detail or title, itemType="VIDEO",
+                title=title, cover=cover, sourceName=self.name,
+            )
+
+        return _drain_pages(
+            fetch_rows, pages, log, progress, make_item,
+            tag=f"{self.name}·搜索「{keyword}」",
+        )
 
     def explore(self, pages: int, log, progress=None) -> list[TraversedItem]:
         found: dict[str, TraversedItem] = {}

@@ -20,15 +20,17 @@ import os
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pc_tagger as core
 import source_engine
+import tag_search
 import win_dialogs
 
-APP_VERSION = "v1.1.1"  # 界面标题栏可见，用于区分新旧 exe
+APP_VERSION = "v1.1.2"  # 界面标题栏可见，用于区分新旧 exe
 
 # exe（PyInstaller onefile）里 __file__ 指向临时解包目录，取 exe 所在目录
 if getattr(sys, "frozen", False):
@@ -81,6 +83,18 @@ PAGE = """<!doctype html>
    书源内容类型：<select id="srcType"><option value="COMIC">漫画</option><option value="NOVEL">小说</option></select>
    <span class="muted">0 = 抓全部页直到没有内容；MacCMS（视频站）固定按视频收录</span>
  </div>
+ <div class="row">
+   <label><input type="checkbox" id="tagSearch"> 标签搜索遍历（待办 #25）</label>
+   <span class="muted">在分类遍历之外，按受控词表的标签逐个搜索源站，补齐站方没建分类的内容；需填书源导入</span>
+ </div>
+ <div class="row" id="tagSearchOpts" style="display:none">
+   只跑这些标签：<input type="text" id="tags" style="width:260px" placeholder="留空 = 按词表顺序跑前 N 个，如 无码,全彩,悬疑">
+   标签数上限：<input type="text" id="tagLimit" value="40" style="width:50px">
+   每标签源数：<input type="text" id="tagSources" value="8" style="width:40px">
+   同义写法：<input type="text" id="tagTerms" value="3" style="width:40px">
+   每写法页数：<input type="text" id="tagPages" value="2" style="width:40px">
+   <span class="muted">写法挑选与 App 同口径；搜索只用来发现条目，不把搜索词写成标签</span>
+ </div>
  <div class="row">输出文件：<input type="text" id="out" value="__DEFAULT_OUT__"> <button onclick="pick('out','save')">另存为…</button> <span class="muted">打标结果 JSON 的保存位置</span></div>
  <div class="row">
    视觉模型：<select id="modelKind">
@@ -125,6 +139,9 @@ PAGE = """<!doctype html>
 
 <script>
 let timer=null;
+document.getElementById('tagSearch').addEventListener('change',function(){
+  document.getElementById('tagSearchOpts').style.display=this.checked?'':'none';
+});
 function pick(id, kind){
   // 经由本机服务调起 Windows 原生文件/目录对话框（tkinter），浏览器里也能用
   fetch('/api/pick',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -137,6 +154,10 @@ function start(){
     body:JSON.stringify({
       list:v('list'), cloud:v('cloud'), sources:v('sources'),
       srcPages:+v('srcPages')||2, srcType:v('srcType')||'COMIC',
+      tagSearch:document.getElementById('tagSearch').checked,
+      tags:v('tags'),
+      tagLimit:+v('tagLimit')||40, tagSources:+v('tagSources')||8,
+      tagTerms:+v('tagTerms')||3, tagPages:+v('tagPages')||2,
       out:v('out'), model:v('model'), modelKind:v('modelKind'), workers:+v('workers')||6,
       limit:+v('limit')||0, push:document.getElementById('push').checked,
       repo:v('repo'), path:v('path'), token:v('token')
@@ -186,7 +207,9 @@ class State:
     """打标任务的共享状态（worker 写，HTTP 线程读，lock 保护）。"""
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        # RLock：打标循环里会出现「持锁期间又要写日志」的嵌套（log() 自身也拿锁），
+        # 用不可重入的 Lock 会直接自死锁，表现为 /api/status 再也不响应
+        self.lock = threading.RLock()
         self.logs: list[str] = []
         self.log_version = 0
         self.running = False
@@ -233,6 +256,7 @@ class TaggingJob(threading.Thread):
             self._work()
         except Exception as exc:  # noqa: BLE001  任何未预期异常都落日志并保存已有结果
             STATE.log(f"任务异常终止：{exc!r}")
+            STATE.log(traceback.format_exc(limit=4).strip())
             self._save()
             STATE.running, STATE.finished = False, True
 
@@ -355,6 +379,66 @@ class TaggingJob(threading.Thread):
                 if STATE.done % 20 == 0:
                     self._save(f"已遍历 {STATE.done} 个源")  # 遍历阶段也边跑边存
 
+        # 标签搜索遍历（v1.8.7.2 待办 #25）：按受控词表逐标签搜源站，补齐分类遍历漏掉的内容
+        if self.cfg.get("tagSearch"):
+            if not pending_sources:
+                STATE.log("标签搜索遍历需要先填「书源导入」")
+                STATE.running, STATE.finished = False, True
+                return
+            by_id: dict[str, object] = {
+                getattr(s, "source_id", "") or s.name: s for s in pending_sources
+            }
+            searchable = [
+                s for s in pending_sources
+                if getattr(s, "can_search", lambda: False)() and getattr(s, "search", None)
+            ]
+            log(f"可搜索源：{len(searchable)}/{len(pending_sources)}")
+            groups = tag_search.load_groups(str(self.cfg["vocab"]))
+            plans = tag_search.build_plans(
+                groups, searchable,
+                only_tags=[t for t in str(self.cfg.get("tags") or "").split(",") if t.strip()]
+                or None,
+                tag_limit=int(self.cfg.get("tagLimit") or 0),
+                sources_per_tag=int(self.cfg.get("tagSources") or 0),
+                terms_per_tag=int(self.cfg.get("tagTerms") or 0),
+            )
+            tag_pages = int(self.cfg.get("tagPages") or 0)
+            log(f"标签搜索计划：{len(plans)} 个标签"
+                f"（写法 ≤{self.cfg.get('tagTerms')} / 源 ≤{self.cfg.get('tagSources')}"
+                f" / 页 ≤{tag_pages}）")
+            for plan in plans:
+                log(f"  · {plan.describe()}")
+
+            def on_progress(tag: str, done_terms: int, total_terms: int,
+                            items_found: int) -> None:
+                with STATE.lock:
+                    STATE.phase = "tagsearch"
+                    STATE.total = total_terms
+                    STATE.done = done_terms
+                    STATE.hit = items_found
+                    STATE.current = tag
+
+            with STATE.lock:
+                STATE.phase = "tagsearch"
+                STATE.total = 1
+                STATE.done = 0
+                STATE.hit = 0
+            try:
+                found_items, stats = tag_search.run_tag_search(
+                    plans, by_id, tag_pages, log,
+                    should_stop=lambda: STATE.stop_event.is_set(),
+                    on_progress=on_progress,
+                )
+            except Exception as exc:  # noqa: BLE001
+                STATE.log(f"标签搜索失败（跳过）：{exc}")
+                found_items, stats = [], {}
+            log(f"标签搜索汇总：{stats}")
+            if found_items:
+                items = core.merge_items(items, found_items)
+                self._items = items
+                log(f"标签搜索新收录：{len(found_items)} 部，合并后共 {len(items)} 条")
+                self._save("标签搜索完成")
+
         if not items:
             STATE.log("网络清单、本地清单与书源导入至少要提供一个")
             STATE.running, STATE.finished = False, True
@@ -386,7 +470,8 @@ class TaggingJob(threading.Thread):
             pending = pending[: self.cfg["limit"]]
         by_source: dict[str, list[dict]] = {}
         for item in pending:
-            by_source[item.get("sourceName") or item.get("sourceId") or "未知源"].append(item)
+            name = item.get("sourceName") or item.get("sourceId") or "未知源"
+            by_source.setdefault(name, []).append(item)
         with STATE.lock:
             STATE.phase = "tag"
             STATE.total = len(pending)
